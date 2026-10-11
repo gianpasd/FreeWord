@@ -3,6 +3,8 @@
 use crate::app::{App, After, Tab};
 use crate::doc::{Align, LINE_BREAK, ListKind, OBJ, PAGE_BREAK, Pos, Rgba, Style};
 use crate::layout::{self, Layout};
+use crate::render::{self, Canvas as _};
+use std::collections::HashMap;
 use eframe::egui::{
     self, Color32, CursorIcon, Event, EventFilter, Key, Modifiers, Pos2, Rect, Sense, Stroke,
     StrokeKind, TextFormat, Ui, Vec2, pos2, text::LayoutJob, vec2,
@@ -111,6 +113,7 @@ impl App {
                     self.enter();
                 }
             }
+            Key::Tab if self.in_table().is_some() && !ctrl => self.next_cell(!shift),
             Key::Tab => {
                 let multi = self.sel().0.p != self.sel().1.p;
                 let p = self.current_para();
@@ -183,6 +186,7 @@ impl App {
             Key::Num2 => self.set_line_spacing(2.0),
             Key::Num5 => self.set_line_spacing(1.5),
             Key::D if shift => self.toggle_strike(),
+            Key::K => self.open_link_dialog(),
             _ => {}
         }
     }
@@ -203,27 +207,29 @@ impl App {
         let li = lay.line_of(self.cursor);
         let (_, x, _, _) = lay.caret(self.cursor);
         let gx = self.goal_x.unwrap_or(x);
-        let mut target = li as i64;
+        // Visual movement: the nearest line above/below that overlaps the goal x.
+        let mut target = Some(li);
         if by_page {
             let mut acc = 0.0;
             let limit = self.viewport_h * 0.9;
+            let mut cur = li;
             while acc < limit {
-                let next = target + dir as i64;
-                if next < 0 || next >= lay.lines.len() as i64 {
-                    break;
+                match lay.vertical(cur, gx, dir) {
+                    Some(n) => {
+                        acc += lay.lines[n].height;
+                        cur = n;
+                    }
+                    None => break,
                 }
-                target = next;
-                acc += lay.lines[target as usize].height;
             }
+            target = Some(cur);
         } else {
-            target += dir as i64;
+            target = target.and_then(|t| lay.vertical(t, gx, dir));
         }
-        let pos = if target < 0 {
-            Pos::default()
-        } else if target >= lay.lines.len() as i64 {
-            self.doc.end()
-        } else {
-            lay.pos_in_line(target as usize, gx)
+        let pos = match target {
+            Some(t) if t != li || by_page => lay.pos_in_line(t, gx),
+            _ if dir < 0 => Pos::default(),
+            _ => self.doc.end(),
         };
         self.set_cursor(pos, extend);
         self.goal_x = Some(gx);
@@ -314,8 +320,15 @@ impl App {
         if resp.hovered() {
             if let Some(p) = pointer {
                 let over_handle = self.selected_image().and_then(|id| handle_of(self, id)).is_some_and(|h| h.contains(p));
+                let ctrl = ui.input(|i| i.modifiers.command);
+                let over_link = ctrl && {
+                    let (_, pos) = self.hit_point(rect, lay, p);
+                    self.doc.paras[pos.p].fmts.get(pos.o).is_some_and(|f| f.link != 0)
+                };
                 let icon = if over_handle {
                     CursorIcon::ResizeNwSe
+                } else if over_link {
+                    CursorIcon::PointingHand
                 } else if self.format_painter.is_some() {
                     CursorIcon::Crosshair
                 } else {
@@ -341,6 +354,15 @@ impl App {
                 self.last_click = (time, p, count);
                 let (page, pos) = self.hit_point(rect, lay, p);
                 self.goal_x = None;
+                // Ctrl+Click follows hyperlinks, like Word.
+                if ui.input(|i| i.modifiers.command) {
+                    let para = &self.doc.paras[pos.p];
+                    let link = [pos.o, pos.o.saturating_sub(1)].into_iter().filter_map(|o| para.fmts.get(o)).map(|f| f.link).find(|l| *l != 0);
+                    if let Some(id) = link {
+                        self.open_link(id);
+                        return;
+                    }
+                }
                 match count {
                     1 => {
                         // Clicking a picture selects it.
@@ -482,7 +504,6 @@ impl App {
     fn paint(&mut self, ui: &Ui, rect: Rect, lay: &Layout) {
         let painter = ui.painter().clone();
         let clip = ui.clip_rect();
-        let sc = lay.scale;
         let (sa, sb) = self.sel();
         let has_sel = self.has_sel();
         let sel_color = Color32::from_rgba_unmultiplied(0x33, 0x99, 0xFF, 80);
@@ -498,6 +519,8 @@ impl App {
         for id in ids {
             self.texture(ui.ctx(), id);
         }
+        let textures: HashMap<u32, egui::TextureId> = self.textures.iter().map(|(k, v)| (*k, v.id())).collect();
+        let sc = lay.scale;
 
         for page in 0..lay.pages {
             let o = self.page_origin(rect, lay, page);
@@ -522,56 +545,28 @@ impl App {
                 painter.line_segment([c, c + vec2(dx * 12.0, 0.0)], guide);
                 painter.line_segment([c, c + vec2(0.0, dy * 12.0)], guide);
             }
+            // Gridlines for borderless tables, like Word's "View Gridlines".
+            for cell in lay.cells.iter().filter(|c| c.page == page && !c.borders) {
+                let r = Rect::from_min_size(o + vec2(cell.x, cell.y), vec2(cell.w, cell.h));
+                painter.rect_stroke(r, 0.0, Stroke::new(1.0, Color32::from_rgb(0xC8, 0xD8, 0xEE)), StrokeKind::Inside);
+            }
 
-            self.paint_header_footer(&painter, lay, o, page);
-
-            for li in lay.page_lines[page].clone() {
+            let mut canvas = EguiCanvas { painter: &painter, origin: o, textures: &textures };
+            let doc = &self.doc;
+            let current = self.find.current;
+            render::draw_page(&mut canvas, doc, lay, page, |cv, li| {
                 let l = &lay.lines[li];
-                let lr = Rect::from_min_size(o + vec2(0.0, l.y), vec2(lay.page_w, l.height));
-                if !lr.intersects(clip) {
-                    continue;
-                }
-                let para = &self.doc.paras[l.para];
-                let pb = &lay.paras[l.para];
-                let top = o.y + l.y;
-                let base = top + l.baseline;
-                let x_of = |k: usize| o.x + l.xs[k - l.start];
-
-                if para.style == Style::Code {
-                    painter.rect_filled(
-                        Rect::from_min_max(pos2(o.x + pb.left - 4.0, top), pos2(o.x + pb.right + 4.0, top + l.height)),
-                        0.0,
-                        Color32::from_gray(243),
-                    );
-                }
-                if para.style == Style::Quote && li == pb.lines.start {
-                    let last = &lay.lines[pb.lines.end - 1];
-                    if last.page == page {
-                        painter.line_segment(
-                            [pos2(o.x + pb.left - 10.0, top), pos2(o.x + pb.left - 10.0, o.y + last.y + last.height)],
-                            Stroke::new(3.0, Color32::from_gray(200)),
-                        );
-                    }
-                }
-
-                let segs = layout::segments(para, l);
-                // Highlights.
-                for s in &segs {
-                    if s.fmt.highlight[3] > 0 {
-                        let r = Rect::from_min_max(pos2(x_of(s.start), top), pos2(x_of(s.end), top + l.height));
-                        painter.rect_filled(r, 0.0, c32(s.fmt.highlight));
-                    }
-                }
-                // Find matches.
+                let top = l.y;
+                let x_of = |k: usize| l.xs[k - l.start];
+                // Search matches.
                 for (i, (ma, mb)) in matches.iter().enumerate() {
                     if ma.p != l.para || mb.o <= l.start || ma.o >= l.end {
                         continue;
                     }
                     let s = ma.o.max(l.start);
                     let e = mb.o.min(l.end);
-                    let cur = self.find.current == Some(i);
-                    let col = if cur { Color32::from_rgb(255, 170, 60) } else { Color32::from_rgb(255, 238, 150) };
-                    painter.rect_filled(Rect::from_min_max(pos2(x_of(s), top), pos2(x_of(e), top + l.height)), 0.0, col);
+                    let col = if current == Some(i) { [255, 170, 60, 255] } else { [255, 238, 150, 255] };
+                    cv.rect(x_of(s), top, x_of(e) - x_of(s), l.height, col);
                 }
                 // Selection.
                 if has_sel && l.para >= sa.p && l.para <= sb.p {
@@ -585,72 +580,49 @@ impl App {
                             x1 += 6.0;
                         }
                         if x1 > x0 {
-                            painter.rect_filled(Rect::from_min_max(pos2(x0, top), pos2(x1, top + l.height)), 0.0, sel_color);
+                            cv.painter.rect_filled(
+                                Rect::from_min_max(cv.origin + vec2(x0, top), cv.origin + vec2(x1, top + l.height)),
+                                0.0,
+                                sel_color,
+                            );
                         }
                     }
                 }
+            });
 
-                // List marker.
-                if l.start == 0 {
-                    if let Some((label, mx)) = &pb.marker {
-                        let mut f = para.fmt_at(0);
-                        f.script = 0;
-                        let (fid, res) = layout::font_for(&f, sc);
-                        self.draw_text(&painter, label, fid, c32(f.color), res.fake_italic, false, pos2(o.x + mx, base));
-                    }
+            for li in lay.page_lines[page].clone() {
+                let l = &lay.lines[li];
+                if l.page != page {
+                    continue;
                 }
-
-                // Text, pictures and decorations.
-                for s in &segs {
-                    let f = s.fmt;
-                    let x0 = x_of(s.start);
-                    let x1 = x_of(s.end);
-                    if f.image != 0 {
-                        if let Some(img) = self.doc.images.get(&f.image).cloned() {
-                            let r = Rect::from_min_size(pos2(x0, base - img.h * sc), vec2(img.w * sc, img.h * sc));
-                            match self.textures.get(&f.image).map(|t| t.id()) {
-                                Some(t) => {
-                                    painter.image(t, r, Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)), Color32::WHITE)
-                                }
-                                None => painter.rect_filled(r, 0.0, Color32::from_gray(220)),
-                            };
-                            let selected = has_sel && sa == Pos::new(l.para, s.start) && sb == Pos::new(l.para, s.end);
-                            if selected {
-                                painter.rect_stroke(r, 0.0, Stroke::new(1.0, Color32::from_rgb(0x2B, 0x57, 0x9A)), StrokeKind::Outside);
-                                painter.rect_filled(Rect::from_center_size(r.max, vec2(8.0, 8.0)), 0.0, Color32::WHITE);
-                                painter.rect_stroke(
-                                    Rect::from_center_size(r.max, vec2(8.0, 8.0)),
-                                    0.0,
-                                    Stroke::new(1.0, Color32::from_rgb(0x2B, 0x57, 0x9A)),
-                                    StrokeKind::Inside,
-                                );
-                            }
-                        }
+                let para = &self.doc.paras[l.para];
+                let base = o.y + l.y + l.baseline;
+                let x_of = |k: usize| o.x + l.xs[k - l.start];
+                // Selected picture: frame and resize handle.
+                for k in l.start..l.end {
+                    let f = para.fmts[k];
+                    if f.image == 0 || !(has_sel && sa == Pos::new(l.para, k) && sb == Pos::new(l.para, k + 1)) {
                         continue;
                     }
-                    let (fid, res) = layout::font_for(&f, sc);
-                    let y = base + layout::script_shift(&f, sc);
-                    if !s.blank {
-                        let t: String = para.chars[s.start..s.end].iter().filter(|c| **c != OBJ).collect();
-                        self.draw_text(&painter, &t, fid.clone(), c32(f.color), res.fake_italic, res.fake_bold, pos2(x0, y));
-                    }
-                    let th = (fid.size * 0.06).max(1.0);
-                    if f.underline {
-                        let uy = y + fid.size * 0.12;
-                        painter.line_segment([pos2(x0, uy), pos2(x1, uy)], Stroke::new(th, c32(f.color)));
-                    }
-                    if f.strike {
-                        let sy = y - fid.size * 0.28;
-                        painter.line_segment([pos2(x0, sy), pos2(x1, sy)], Stroke::new(th, c32(f.color)));
+                    if let Some(img) = self.doc.images.get(&f.image) {
+                        let r = Rect::from_min_size(pos2(x_of(k), base - img.h * sc), vec2(img.w * sc, img.h * sc));
+                        let blue = Color32::from_rgb(0x2B, 0x57, 0x9A);
+                        painter.rect_stroke(r, 0.0, Stroke::new(1.0, blue), StrokeKind::Outside);
+                        let h = Rect::from_center_size(r.max, vec2(8.0, 8.0));
+                        painter.rect_filled(h, 0.0, Color32::WHITE);
+                        painter.rect_stroke(h, 0.0, Stroke::new(1.0, blue), StrokeKind::Inside);
                     }
                 }
-
                 // Formatting marks.
                 if self.show_marks {
                     let mf = egui::FontId::proportional((11.0 * sc).max(6.0));
                     for k in l.start..l.end {
                         let c = para.chars[k];
+                        let f = para.fmts[k];
                         let (x0, x1) = (x_of(k), x_of(k + 1));
+                        if f.hidden {
+                            continue;
+                        }
                         match c {
                             ' ' => {
                                 painter.circle_filled(pos2((x0 + x1) / 2.0, base - 3.0 * sc), 1.2 * sc.max(1.0), mark_color);
@@ -662,23 +634,38 @@ impl App {
                                 painter.text(pos2(x0, base), egui::Align2::LEFT_BOTTOM, "↵", mf.clone(), mark_color);
                             }
                             PAGE_BREAK => {
-                                let r = pos2(o.x + pb.right, base);
+                                let r = o.x + lay.paras[l.para].right;
                                 let left = pos2(x0 + 4.0, base - 4.0);
-                                painter.line_segment([left, pos2(r.x, left.y)], Stroke::new(1.0, mark_color));
+                                painter.line_segment([left, pos2(r, left.y)], Stroke::new(1.0, mark_color));
                                 painter.text(
-                                    pos2((left.x + r.x) / 2.0, left.y),
+                                    pos2((left.x + r) / 2.0, left.y),
                                     egui::Align2::CENTER_CENTER,
                                     " Page Break ",
                                     mf.clone(),
                                     mark_color,
                                 );
                             }
+                            OBJ if f.obj != 0 => {
+                                // Show where fields and bookmarks are.
+                                if let Some(ob) = crate::pool::obj(f.obj) {
+                                    let glyph = match ob.kind {
+                                        crate::pool::ObjKind::FieldBegin => Some("{"),
+                                        crate::pool::ObjKind::FieldEnd => Some("}"),
+                                        crate::pool::ObjKind::Hidden if ob.xml.contains("bookmarkStart") => Some("["),
+                                        _ => None,
+                                    };
+                                    if let Some(g) = glyph {
+                                        painter.text(pos2(x0, base), egui::Align2::CENTER_BOTTOM, g, mf.clone(), Color32::from_gray(150));
+                                    }
+                                }
+                            }
                             _ => {}
                         }
                     }
                     if l.last_in_para {
                         let x = x_of(l.end);
-                        painter.text(pos2(x + 1.0, base), egui::Align2::LEFT_BOTTOM, "¶", mf.clone(), mark_color);
+                        let mark = if para.cell.is_some() && self.doc.at_cell_end(Pos::new(l.para, para.len())) { "¤" } else { "¶" };
+                        painter.text(pos2(x + 1.0, base), egui::Align2::LEFT_BOTTOM, mark, mf.clone(), mark_color);
                     }
                 }
             }
@@ -687,69 +674,15 @@ impl App {
         // Caret.
         if caret_on && !self.text_input_focused && (!has_sel || self.drag.selecting) && self.selected_image().is_none() {
             let (pg, x, y, h) = lay.caret(self.cursor);
-            let ls = self.doc.paras[self.cursor.p].line_spacing.max(1.0);
+            let p = &self.doc.paras[self.cursor.p];
+            let ls = if p.line_rule == crate::doc::LineRule::Auto { p.line_spacing.max(1.0) } else { 1.0 };
             let o = self.page_origin(rect, lay, pg);
             let ch = h / ls;
-            let top = o + vec2(x, y + (h - ch).min(0.0));
+            let top = o + vec2(x, y);
             painter.line_segment([top, top + vec2(0.0, ch)], Stroke::new(1.5, Color32::BLACK));
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn draw_text(
-        &self,
-        painter: &egui::Painter,
-        text: &str,
-        font_id: egui::FontId,
-        color: Color32,
-        italics: bool,
-        bold: bool,
-        baseline: Pos2,
-    ) {
-        let size = font_id.size;
-        let job = LayoutJob::single_section(
-            text.to_string(),
-            TextFormat { font_id, color, italics, ..Default::default() },
-        );
-        let galley = painter.layout_job(job);
-        let asc = galley
-            .rows
-            .first()
-            .and_then(|r| r.row.glyphs.first().map(|g| r.pos.y + g.pos.y))
-            .unwrap_or(size * 0.8);
-        let pos = baseline - vec2(0.0, asc);
-        if bold {
-            painter.galley(pos + vec2((size * 0.04).max(0.6), 0.0), galley.clone(), color);
-        }
-        painter.galley(pos, galley, color);
-    }
-
-    fn paint_header_footer(&self, painter: &egui::Painter, lay: &Layout, o: Pos2, page: usize) {
-        let [mt, mr, mb, ml] = lay.margins;
-        let font = egui::FontId::new(
-            10.0 * lay.scale,
-            crate::fonts::resolve(crate::fonts::font_id(crate::fonts::default_font()), false, false).family,
-        );
-        let color = Color32::from_gray(0x59);
-        let cx = o.x + ml + (lay.page_w - ml - mr) / 2.0;
-        if !self.doc.header.is_empty() {
-            let g = painter.layout_no_wrap(self.doc.header.clone(), font.clone(), color);
-            self.draw_text(painter, &self.doc.header, font.clone(), color, false, false, pos2(cx - g.size().x / 2.0, o.y + mt / 2.0));
-        }
-        let mut footer = self.doc.footer.clone();
-        if self.doc.page_numbers {
-            if !footer.is_empty() {
-                footer.push_str("    ");
-            }
-            footer.push_str(&format!("Page {} of {}", page + 1, lay.pages));
-        }
-        if !footer.is_empty() {
-            let g = painter.layout_no_wrap(footer.clone(), font.clone(), color);
-            self.draw_text(painter, &footer, font, color, false, false, pos2(cx - g.size().x / 2.0, o.y + lay.page_h - mb / 2.0));
-        }
-    }
-
-    /// Horizontal ruler showing margins and the current paragraph indent.
     pub fn ruler(&self, ui: &mut Ui) {
         let Some(lay) = &self.layout else { return };
         let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 22.0), Sense::hover());
@@ -813,6 +746,50 @@ impl App {
                 ((avail.y - 2.0 * GAP) / ph).min((avail.x - 2.0 * GAP) / pw)
             };
             self.zoom = z.clamp(0.1, 5.0);
+        }
+    }
+}
+
+/// Screen implementation of the shared page renderer.
+struct EguiCanvas<'a> {
+    painter: &'a egui::Painter,
+    origin: Pos2,
+    textures: &'a HashMap<u32, egui::TextureId>,
+}
+
+impl render::Canvas for EguiCanvas<'_> {
+    fn rect(&mut self, x: f32, y: f32, w: f32, h: f32, c: Rgba) {
+        let r = Rect::from_min_size(self.origin + vec2(x, y), vec2(w, h));
+        self.painter.rect_filled(r, 0.0, c32(c));
+    }
+
+    fn line(&mut self, x0: f32, y0: f32, x1: f32, y1: f32, width: f32, c: Rgba) {
+        self.painter.line_segment([self.origin + vec2(x0, y0), self.origin + vec2(x1, y1)], Stroke::new(width, c32(c)));
+    }
+
+    fn text(&mut self, x: f32, y: f32, text: &str, f: &crate::doc::CharFmt, size: f32) {
+        let r = crate::fonts::resolve(f.font, f.bold, f.italic);
+        let font_id = egui::FontId::new(size.max(1.0), r.family);
+        let color = c32(f.color);
+        let job = LayoutJob::single_section(text.to_string(), TextFormat { font_id, color, italics: r.fake_italic, ..Default::default() });
+        let galley = self.painter.layout_job(job);
+        let asc = galley.rows.first().and_then(|row| row.row.glyphs.first().map(|g| row.pos.y + g.pos.y)).unwrap_or(size * 0.8);
+        let pos = self.origin + vec2(x, y - asc);
+        if r.fake_bold {
+            self.painter.galley(pos + vec2((size * 0.04).max(0.6), 0.0), galley.clone(), color);
+        }
+        self.painter.galley(pos, galley, color);
+    }
+
+    fn image(&mut self, id: u32, x: f32, y: f32, w: f32, h: f32) {
+        let r = Rect::from_min_size(self.origin + vec2(x, y), vec2(w, h));
+        match self.textures.get(&id) {
+            Some(t) => {
+                self.painter.image(*t, r, Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)), Color32::WHITE);
+            }
+            None => {
+                self.painter.rect_filled(r, 0.0, Color32::from_gray(220));
+            }
         }
     }
 }

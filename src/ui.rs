@@ -721,9 +721,47 @@ impl App {
                 self.insert_line_break();
             }
         });
+        group(ui, "Tables", |ui| {
+            let r = big_btn(ui, "▦", "Table", "Insert a table");
+            egui::Popup::menu(&r).show(|ui| {
+                ui.label("Insert Table");
+                let hover = egui::Id::new("table_picker_hover");
+                let (hr, hc): (u32, u32) = ui.data(|d| d.get_temp(hover)).unwrap_or((0, 0));
+                let mut new_hover = (0, 0);
+                let mut picked = None;
+                egui::Grid::new("table_picker").spacing(vec2(2.0, 2.0)).show(ui, |ui| {
+                    for r in 1..=8u32 {
+                        for c in 1..=10u32 {
+                            let (rect, resp) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::click());
+                            let on = r <= hr && c <= hc;
+                            ui.painter().rect_filled(rect, 0.0, if on { Color32::from_rgb(0xF2, 0xC1, 0x8B) } else { Color32::WHITE });
+                            ui.painter().rect_stroke(rect, 0.0, Stroke::new(1.0, Color32::from_gray(150)), egui::StrokeKind::Inside);
+                            if resp.hovered() {
+                                new_hover = (r, c);
+                            }
+                            if resp.clicked() {
+                                picked = Some((r, c));
+                            }
+                        }
+                        ui.end_row();
+                    }
+                });
+                ui.data_mut(|d| d.insert_temp(hover, new_hover));
+                ui.label(if new_hover.0 > 0 { format!("{} × {} Table", new_hover.1, new_hover.0) } else { "Pick a size".into() });
+                if let Some((r, c)) = picked {
+                    self.insert_table(r, c);
+                    ui.close();
+                }
+            });
+        });
         group(ui, "Illustrations", |ui| {
             if big_btn(ui, "🖼", "Pictures", "Insert a picture from a file").clicked() {
                 self.insert_picture();
+            }
+        });
+        group(ui, "Links", |ui| {
+            if big_btn(ui, "🔗", "Link", "Insert a hyperlink (Ctrl+K)").clicked() {
+                self.open_link_dialog();
             }
         });
         if let Some(id) = self.selected_image() {
@@ -851,18 +889,31 @@ impl App {
             });
         });
         let para = self.current_para().clone();
-        group(ui, "Paragraph", |ui| {
+        group(ui, "Indent", |ui| {
             ui.vertical(|ui| {
-                ui.horizontal(|ui| {
-                    ui.label("Indent level:");
-                    if icon_btn(ui, Icon::IndentLess, false, "Decrease Indent").clicked() {
-                        self.indent(-1);
-                    }
-                    ui.label(format!("{}", para.level));
-                    if icon_btn(ui, Icon::IndentMore, false, "Increase Indent").clicked() {
-                        self.indent(1);
-                    }
-                });
+                let inch = |ui: &mut Ui, label: &str, v: f32| -> Option<f32> {
+                    ui.horizontal(|ui| {
+                        ui.add_sized(vec2(42.0, 18.0), egui::Label::new(label));
+                        let mut x = v / 72.0;
+                        ui.add(egui::DragValue::new(&mut x).range(-5.0..=10.0).speed(0.01).fixed_decimals(2).suffix("\""))
+                            .changed()
+                            .then_some(x * 72.0)
+                    })
+                    .inner
+                };
+                if let Some(v) = inch(ui, "Left:", para.ind_left) {
+                    self.apply_para(|p| p.ind_left = v);
+                }
+                if let Some(v) = inch(ui, "Right:", para.ind_right) {
+                    self.apply_para(|p| p.ind_right = v);
+                }
+                if let Some(v) = inch(ui, "First:", para.ind_first) {
+                    self.apply_para(|p| p.ind_first = v);
+                }
+            });
+        });
+        group(ui, "Spacing", |ui| {
+            ui.vertical(|ui| {
                 ui.horizontal(|ui| {
                     ui.label("Before:");
                     let mut b = para.space_before;
@@ -878,12 +929,98 @@ impl App {
                 ui.horizontal(|ui| {
                     ui.label("Line spacing:");
                     let mut ls = para.line_spacing;
-                    if ui.add(egui::DragValue::new(&mut ls).range(0.5..=5.0).speed(0.05).fixed_decimals(2)).changed() {
-                        self.set_line_spacing(ls);
+                    if para.line_rule == crate::doc::LineRule::Auto {
+                        if ui.add(egui::DragValue::new(&mut ls).range(0.5..=5.0).speed(0.05).fixed_decimals(2)).changed() {
+                            self.set_line_spacing(ls);
+                        }
+                    } else {
+                        let label = if para.line_rule == crate::doc::LineRule::Exact { "Exactly" } else { "At least" };
+                        ui.label(label);
+                        if ui.add(egui::DragValue::new(&mut ls).range(1.0..=200.0).speed(0.5).suffix(" pt")).changed() {
+                            self.apply_para(|p| p.line_spacing = ls);
+                        }
                     }
                 });
             });
         });
+        if self.in_table().is_some() {
+            self.table_group(ui);
+        }
+    }
+
+    fn table_group(&mut self, ui: &mut Ui) {
+        group(ui, "Table", |ui| {
+            ui.vertical(|ui| {
+                ui.horizontal(|ui| {
+                    if small_btn(ui, "⬆", "Row Above", "Insert a row above").clicked() {
+                        self.table_insert_row(false);
+                    }
+                    if small_btn(ui, "⬇", "Row Below", "Insert a row below").clicked() {
+                        self.table_insert_row(true);
+                    }
+                });
+                ui.horizontal(|ui| {
+                    if small_btn(ui, "⬅", "Column Left", "Insert a column to the left").clicked() {
+                        self.table_insert_col(false);
+                    }
+                    if small_btn(ui, "➡", "Column Right", "Insert a column to the right").clicked() {
+                        self.table_insert_col(true);
+                    }
+                });
+                ui.horizontal(|ui| {
+                    let r = small_btn(ui, "✖", "Delete", "Delete rows, columns or the table");
+                    egui::Popup::menu(&r).show(|ui| {
+                        if ui.button("Delete Row").clicked() {
+                            self.table_delete_row();
+                            ui.close();
+                        }
+                        if ui.button("Delete Column").clicked() {
+                            self.table_delete_col();
+                            ui.close();
+                        }
+                        if ui.button("Delete Table").clicked() {
+                            self.delete_table();
+                            ui.close();
+                        }
+                    });
+                    let borders = self.in_table().and_then(|c| self.doc.tables.get(&c.table)).is_some_and(|t| t.borders);
+                    if small_btn(ui, "▦", if borders { "No Borders" } else { "All Borders" }, "Toggle table borders").clicked() {
+                        self.toggle_table_borders();
+                    }
+                    let r = small_btn(ui, "▩", "Shading", "Cell shading");
+                    egui::Popup::menu(&r).show(|ui| {
+                        ui.horizontal(|ui| {
+                            for c in THEME_COLORS.iter().chain(STANDARD_COLORS.iter()) {
+                                if swatch(ui, tint(*c, 0.6), "") {
+                                    self.shade_cell(Some(tint(*c, 0.6)));
+                                    ui.close();
+                                }
+                            }
+                        });
+                        if ui.button("No Color").clicked() {
+                            self.shade_cell(None);
+                            ui.close();
+                        }
+                    });
+                });
+            });
+        });
+    }
+
+    pub fn open_link_dialog(&mut self) {
+        let existing = self.link_at_cursor().map(crate::pool::link);
+        self.dlg.link_url = match existing {
+            Some((url, anchor)) if url.is_empty() => format!("#{anchor}"),
+            Some((url, _)) => url,
+            None => String::new(),
+        };
+        self.dlg.link_text = if self.has_sel() {
+            let (a, b) = self.sel();
+            self.doc.plain_text(a, b)
+        } else {
+            String::new()
+        };
+        self.dlg.link = true;
     }
 
     fn review_tab(&mut self, ui: &mut Ui) {
@@ -1174,8 +1311,20 @@ impl App {
                         }
                     });
                     ui.end_row();
-                    ui.label("Indent level:");
-                    ui.add(egui::DragValue::new(&mut p.level).range(0..=8));
+                    let inch = |ui: &mut Ui, v: &mut f32| {
+                        let mut x = *v / 72.0;
+                        if ui.add(egui::DragValue::new(&mut x).range(-5.0..=10.0).speed(0.01).fixed_decimals(2).suffix("\"")).changed() {
+                            *v = x * 72.0;
+                        }
+                    };
+                    ui.label("Indent left:");
+                    inch(ui, &mut p.ind_left);
+                    ui.end_row();
+                    ui.label("Indent right:");
+                    inch(ui, &mut p.ind_right);
+                    ui.end_row();
+                    ui.label("First line (− = hanging):");
+                    inch(ui, &mut p.ind_first);
                     ui.end_row();
                     ui.label("Spacing before:");
                     ui.add(egui::DragValue::new(&mut p.space_before).range(0.0..=200.0).suffix(" pt"));
@@ -1184,25 +1333,101 @@ impl App {
                     ui.add(egui::DragValue::new(&mut p.space_after).range(0.0..=200.0).suffix(" pt"));
                     ui.end_row();
                     ui.label("Line spacing:");
-                    ui.add(egui::DragValue::new(&mut p.line_spacing).range(0.5..=5.0).speed(0.05).fixed_decimals(2));
+                    ui.horizontal(|ui| {
+                        use crate::doc::LineRule;
+                        let prev_rule = p.line_rule;
+                        egui::ComboBox::from_id_salt("lr").selected_text(match p.line_rule {
+                            LineRule::Auto => "Multiple",
+                            LineRule::AtLeast => "At least",
+                            LineRule::Exact => "Exactly",
+                        }).show_ui(ui, |ui| {
+                            ui.selectable_value(&mut p.line_rule, LineRule::Auto, "Multiple");
+                            ui.selectable_value(&mut p.line_rule, LineRule::AtLeast, "At least");
+                            ui.selectable_value(&mut p.line_rule, LineRule::Exact, "Exactly");
+                        });
+                        if p.line_rule != prev_rule {
+                            p.line_spacing = if p.line_rule == LineRule::Auto { 1.0 } else { 12.0 };
+                        }
+                        if p.line_rule == LineRule::Auto {
+                            ui.add(egui::DragValue::new(&mut p.line_spacing).range(0.5..=5.0).speed(0.05).fixed_decimals(2));
+                        } else {
+                            ui.add(egui::DragValue::new(&mut p.line_spacing).range(1.0..=200.0).suffix(" pt"));
+                        }
+                    });
+                    ui.end_row();
+                    ui.label("");
+                    ui.checkbox(&mut p.contextual, "Don't add space between paragraphs of the same style");
+                    ui.end_row();
+                    ui.label("");
+                    ui.checkbox(&mut p.page_break_before, "Page break before");
                     ui.end_row();
                 });
             });
-            if p.align != before.align
-                || p.level != before.level
+            let changed = p.align != before.align
+                || p.ind_left != before.ind_left
+                || p.ind_right != before.ind_right
+                || p.ind_first != before.ind_first
                 || p.space_before != before.space_before
                 || p.space_after != before.space_after
                 || p.line_spacing != before.line_spacing
-            {
+                || p.line_rule != before.line_rule
+                || p.contextual != before.contextual
+                || p.page_break_before != before.page_break_before;
+            if changed {
                 self.apply_para(|q| {
                     q.align = p.align;
-                    q.level = p.level;
+                    q.ind_left = p.ind_left;
+                    q.ind_right = p.ind_right;
+                    q.ind_first = p.ind_first;
                     q.space_before = p.space_before;
                     q.space_after = p.space_after;
                     q.line_spacing = p.line_spacing;
+                    q.line_rule = p.line_rule;
+                    q.contextual = p.contextual;
+                    q.page_break_before = p.page_break_before;
                 });
             }
             self.dlg.paragraph = open;
+        }
+
+        if self.dlg.link {
+            let mut open = true;
+            let mut apply = false;
+            let mut remove = false;
+            let editing_existing = self.link_at_cursor().is_some();
+            egui::Window::new("Insert Hyperlink").open(&mut open).collapsible(false).resizable(false).show(ctx, |ui| {
+                egui::Grid::new("link").num_columns(2).show(ui, |ui| {
+                    ui.label("Text to display:");
+                    let r = ui.add_enabled(!self.has_sel(), egui::TextEdit::singleline(&mut self.dlg.link_text).desired_width(300.0));
+                    self.track(&r);
+                    ui.end_row();
+                    ui.label("Address:");
+                    let r = ui.add(egui::TextEdit::singleline(&mut self.dlg.link_url).desired_width(300.0).hint_text("https://… or #bookmark"));
+                    self.track(&r);
+                    if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        apply = true;
+                    }
+                    ui.end_row();
+                });
+                ui.horizontal(|ui| {
+                    if ui.button("OK").clicked() {
+                        apply = true;
+                    }
+                    if editing_existing && ui.button("Remove Link").clicked() {
+                        remove = true;
+                    }
+                });
+            });
+            if apply {
+                let (url, text) = (self.dlg.link_url.clone(), self.dlg.link_text.clone());
+                self.insert_link(&url, &text);
+                open = false;
+            }
+            if remove {
+                self.remove_link();
+                open = false;
+            }
+            self.dlg.link = open;
         }
 
         if self.dlg.about {

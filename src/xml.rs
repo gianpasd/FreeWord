@@ -154,17 +154,6 @@ impl El {
         s.push('>');
     }
 
-    /// Serializes only the children.
-    pub fn inner_xml(&self) -> String {
-        let mut s = String::new();
-        for c in &self.children {
-            match c {
-                Node::Text(t) => s.push_str(&esc_text(t)),
-                Node::El(e) => e.write(&mut s),
-            }
-        }
-        s
-    }
 }
 
 #[allow(deprecated)]

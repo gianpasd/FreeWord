@@ -63,6 +63,9 @@ pub struct Dialogs {
     pub paragraph: bool,
     pub about: bool,
     pub shortcuts: bool,
+    pub link: bool,
+    pub link_url: String,
+    pub link_text: String,
     pub error: Option<String>,
 }
 

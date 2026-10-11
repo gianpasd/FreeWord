@@ -461,11 +461,6 @@ impl Para {
         };
         f.without_object()
     }
-
-    /// Visible text width class: paragraphs that only hold an opaque block.
-    pub fn is_block_placeholder(&self) -> bool {
-        self.raw_block.is_some()
-    }
 }
 
 /// Removes a `w:sectPr` element from raw pPr XML.
@@ -822,11 +817,6 @@ impl Document {
             first.ppr_extra = last.ppr_extra.clone();
         }
         self.paras.drain(a.p + 1..=b.p);
-    }
-
-    /// Whether `pos` is at the start of a cell (Backspace must not merge).
-    pub fn at_cell_start(&self, pos: Pos) -> bool {
-        pos.o == 0 && pos.p > 0 && self.paras[pos.p].cell != self.paras[pos.p - 1].cell
     }
 
     pub fn at_cell_end(&self, pos: Pos) -> bool {

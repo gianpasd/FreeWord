@@ -10,6 +10,7 @@ mod layout;
 mod numbering;
 mod pdf;
 mod pool;
+mod render;
 mod styles;
 mod ui;
 mod xml;
@@ -33,3 +34,4 @@ fn main() -> eframe::Result {
     };
     eframe::run_native("FreeWord", options, Box::new(|cc| Ok(Box::new(app::App::new(cc)))))
 }
+

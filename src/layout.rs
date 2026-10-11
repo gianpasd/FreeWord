@@ -4,7 +4,7 @@
 //! corner of the page the line lives on.
 
 use crate::doc::{
-    self, Align, CharFmt, COLUMN_BREAK, Document, LINE_BREAK, Leader, LineRule, ListKind, PAGE_BREAK, Pos,
+    self, Align, CharFmt, COLUMN_BREAK, Document, LINE_BREAK, Leader, LineRule, PAGE_BREAK, Pos,
     Rgba, TabKind, VMerge,
 };
 use crate::fonts;
@@ -71,6 +71,15 @@ pub struct Layout {
     pub margins: [f32; 4],
     /// Display text for objects that show computed labels (footnote numbers...).
     pub obj_text: HashMap<(usize, usize), String>,
+    /// Header text and its width.
+    pub header: (String, f32),
+    /// Footer text and width for each page.
+    pub footers: Vec<(String, f32)>,
+}
+
+/// Format used for header and footer text.
+pub fn hf_fmt() -> CharFmt {
+    CharFmt { size: 10.0, color: [0x59, 0x59, 0x59, 255], ..CharFmt::body() }
 }
 
 /// Font used to draw a character with format `f` at `scale` points-per-pt.
@@ -681,6 +690,21 @@ pub fn layout(doc: &Document, fonts: &mut FontsView<'_>, zoom: f32) -> Layout {
         .into_iter()
         .map(|b| b.unwrap_or(ParaBox { lines: 0..0, left: ml, right: pw - mr, marker: None }))
         .collect();
+    let hf = hf_fmt();
+    let header = (doc.header.clone(), ctx.text_width(&hf, &doc.header));
+    let footers = (0..pages)
+        .map(|pg| {
+            let mut s = doc.footer.clone();
+            if doc.page_numbers {
+                if !s.is_empty() {
+                    s.push_str("    ");
+                }
+                s.push_str(&format!("Page {} of {}", pg + 1, pages));
+            }
+            let w = ctx.text_width(&hf, &s);
+            (s, w)
+        })
+        .collect();
 
     Layout {
         lines,
@@ -693,6 +717,8 @@ pub fn layout(doc: &Document, fonts: &mut FontsView<'_>, zoom: f32) -> Layout {
         page_h: ph,
         margins: [mt, mr, mb, ml],
         obj_text: ctx.obj_text,
+        header,
+        footers,
     }
 }
 
@@ -844,9 +870,4 @@ impl Layout {
         }
         overlap.map(|o| o.1).or(any.map(|a| a.2))
     }
-}
-
-/// Lists FreeWord can toggle are always backed by a numbering instance.
-pub fn is_list(p: &doc::Para) -> bool {
-    p.list != ListKind::None
 }
