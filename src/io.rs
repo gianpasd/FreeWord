@@ -355,6 +355,9 @@ pub fn load_native(path: &Path) -> Result<Document, String> {
         Some(n) => doc.numbering = n,
         None => doc.numbering = Numbering::new_default(),
     }
+    if let Some(pkg) = doc.pkg.clone() {
+        doc.hf = crate::docx::hf_from_parts(&pkg.parts, pkg.body_sect.as_deref(), pkg.id, &doc.styles, &doc.numbering);
+    }
     for im in fd.images {
         if let Ok(bytes) = b64.decode(im.data.as_bytes()) {
             if let Ok(mut data) = image_from_bytes(bytes, f32::MAX) {

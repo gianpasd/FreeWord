@@ -58,9 +58,75 @@ fn leader<C: Canvas>(c: &mut C, x0: f32, x1: f32, base: f32, kind: Leader, f: &C
     }
 }
 
+/// Shifts drawing vertically (used to place footers).
+struct Offset<'a, C: Canvas> {
+    inner: &'a mut C,
+    dy: f32,
+}
+
+impl<C: Canvas> Canvas for Offset<'_, C> {
+    fn rect(&mut self, x: f32, y: f32, w: f32, h: f32, c: Rgba) {
+        self.inner.rect(x, y + self.dy, w, h, c);
+    }
+    fn line(&mut self, x0: f32, y0: f32, x1: f32, y1: f32, width: f32, c: Rgba) {
+        self.inner.line(x0, y0 + self.dy, x1, y1 + self.dy, width, c);
+    }
+    fn text(&mut self, x: f32, y: f32, text: &str, f: &CharFmt, size: f32) {
+        self.inner.text(x, y + self.dy, text, f, size);
+    }
+    fn image(&mut self, id: u32, x: f32, y: f32, w: f32, h: f32) {
+        self.inner.image(id, x, y + self.dy, w, h);
+    }
+}
+
 /// Paints everything on `page` except overlays. `under` is called for each
 /// line after backgrounds and before text (selection, search highlights).
-pub fn draw_page<C: Canvas>(c: &mut C, doc: &Document, lay: &Layout, page: usize, mut under: impl FnMut(&mut C, usize)) {
+pub fn draw_page<C: Canvas>(c: &mut C, doc: &Document, lay: &Layout, page: usize, under: impl FnMut(&mut C, usize)) {
+    let pages = lay.pages;
+    draw_content(c, doc, lay, page, (page + 1, pages), under);
+    let sc = lay.scale;
+    let subs = [&doc.hf.header, &doc.hf.header_first, &doc.hf.footer, &doc.hf.footer_first];
+    for header in [true, false] {
+        let rich = if header { lay.rich_header } else { lay.rich_footer };
+        if rich {
+            if let Some(i) = layout::hf_variant(doc, header, page) {
+                if let (Some(l), Some(d)) = (&lay.hf[i], subs[i]) {
+                    let mut oc = Offset { inner: &mut *c, dy: lay.hf_dy[i] };
+                    for p in 0..l.pages {
+                        draw_content(&mut oc, d, l, p, (page + 1, pages), |_, _| {});
+                    }
+                }
+            }
+            continue;
+        }
+        // Plain-text header/footer.
+        let hf = layout::hf_fmt();
+        let size = hf.size * sc;
+        let [_, mr, _, ml] = lay.margins;
+        let cx = ml + (lay.page_w - ml - mr) / 2.0;
+        if header {
+            if !lay.header.0.is_empty() {
+                let y = doc.page.header_dist * sc + size * 0.8;
+                c.text(cx - lay.header.1 / 2.0, y, &lay.header.0, &hf, size);
+            }
+        } else if let Some((text, w)) = lay.footers.get(page) {
+            if !text.is_empty() {
+                let y = lay.page_h - doc.page.footer_dist * sc - size * 0.25;
+                c.text(cx - w / 2.0, y, text, &hf, size);
+            }
+        }
+    }
+}
+
+/// Paints the paragraphs and tables of one page of `lay`.
+fn draw_content<C: Canvas>(
+    c: &mut C,
+    doc: &Document,
+    lay: &Layout,
+    page: usize,
+    page_no: (usize, usize),
+    mut under: impl FnMut(&mut C, usize),
+) {
     let sc = lay.scale;
     // Table cell shading.
     for cell in lay.cells.iter().filter(|b| b.page == page) {
@@ -94,7 +160,7 @@ pub fn draw_page<C: Canvas>(c: &mut C, doc: &Document, lay: &Layout, page: usize
             }
         }
         under(c, li);
-        draw_line(c, doc, lay, l);
+        draw_line(c, doc, lay, l, page_no);
     }
     // Cell borders on top of everything else.
     for cell in lay.cells.iter().filter(|b| b.page == page && b.borders) {
@@ -107,24 +173,9 @@ pub fn draw_page<C: Canvas>(c: &mut C, doc: &Document, lay: &Layout, page: usize
         c.line(cell.x, cell.y, cell.x, cell.y + cell.h, w, k);
         c.line(cell.x + cell.w, cell.y, cell.x + cell.w, cell.y + cell.h, w, k);
     }
-    // Header and footer.
-    let hf = layout::hf_fmt();
-    let size = hf.size * sc;
-    let [_, mr, _, ml] = lay.margins;
-    let cx = ml + (lay.page_w - ml - mr) / 2.0;
-    if !lay.header.0.is_empty() {
-        let y = doc.page.header_dist * sc + size * 0.8;
-        c.text(cx - lay.header.1 / 2.0, y, &lay.header.0, &hf, size);
-    }
-    if let Some((text, w)) = lay.footers.get(page) {
-        if !text.is_empty() {
-            let y = lay.page_h - doc.page.footer_dist * sc - size * 0.25;
-            c.text(cx - w / 2.0, y, text, &hf, size);
-        }
-    }
 }
 
-fn draw_line<C: Canvas>(c: &mut C, doc: &Document, lay: &Layout, l: &Line) {
+fn draw_line<C: Canvas>(c: &mut C, doc: &Document, lay: &Layout, l: &Line, page_no: (usize, usize)) {
     let sc = lay.scale;
     let para = &doc.paras[l.para];
     let base = l.y + l.baseline;
@@ -143,9 +194,20 @@ fn draw_line<C: Canvas>(c: &mut C, doc: &Document, lay: &Layout, l: &Line) {
         let (x0, x1) = Layout::x_range(l, *k, *k + 1);
         leader(c, x0, x1, base, *kind, &para.fmts[*k], sc);
     }
+    let fields: Vec<&(usize, usize, usize, bool)> =
+        lay.page_fields.iter().filter(|(p, s, e, _)| *p == l.para && *s < l.end && *e > l.start).collect();
     for s in layout::segments(para, l) {
         let f = s.fmt;
         let (x0, x1) = Layout::x_range(l, s.start, s.end);
+        // PAGE / NUMPAGES results show the live number instead of the stored text.
+        if let Some((_, fs, _, total)) = fields.iter().find(|(_, fs, fe, _)| s.start >= *fs && s.start < *fe) {
+            if s.start == *fs.max(&l.start) {
+                let n = if *total { page_no.1 } else { page_no.0 };
+                let (fid, _) = layout::font_for(&f, sc);
+                c.text(x0, base + layout::script_shift(&f, sc), &n.to_string(), &f, fid.size);
+            }
+            continue;
+        }
         if f.image != 0 {
             if let Some(img) = doc.images.get(&f.image) {
                 c.image(f.image, x0, base - img.h * sc, img.w * sc, img.h * sc);

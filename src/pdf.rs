@@ -47,7 +47,8 @@ impl Resources {
         self.images
             .entry(id)
             .or_insert_with(|| {
-                let bytes = doc.images.get(&id)?.bytes.clone();
+                // Header/footer pictures live in their own documents.
+                let bytes = doc.all_images().into_iter().find(|(k, _)| *k == id)?.1.bytes.clone();
                 let data = || Data::from(bytes.to_vec());
                 match crate::io::image_kind(&bytes).0 {
                     "png" => Image::from_png(data(), true).ok(),

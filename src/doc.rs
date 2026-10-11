@@ -547,9 +547,21 @@ pub struct Package {
     pub background: Option<String>,
 }
 
+/// Rich header/footer content read from a .docx (laid out like the body).
+#[derive(Clone, Debug, Default)]
+pub struct HeaderFooter {
+    pub header: Option<Box<Document>>,
+    pub header_first: Option<Box<Document>>,
+    pub footer: Option<Box<Document>>,
+    pub footer_first: Option<Box<Document>>,
+    /// Different first page (`w:titlePg`).
+    pub title_page: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct Document {
     pub paras: Vec<Para>,
+    pub hf: HeaderFooter,
     pub page: PageSetup,
     pub header: String,
     pub footer: String,
@@ -582,6 +594,7 @@ impl Document {
     pub fn new() -> Self {
         Document {
             paras: vec![Para::new(Style::Normal)],
+            hf: HeaderFooter::default(),
             page: PageSetup::default(),
             header: String::new(),
             footer: String::new(),
@@ -592,6 +605,15 @@ impl Document {
             styles: Arc::new(StyleSheet::generated()),
             pkg: None,
         }
+    }
+
+    /// All image stores (body plus header/footer documents).
+    pub fn all_images(&self) -> Vec<(u32, &ImageData)> {
+        let mut v: Vec<(u32, &ImageData)> = self.images.iter().map(|(k, v)| (*k, v)).collect();
+        for d in [&self.hf.header, &self.hf.header_first, &self.hf.footer, &self.hf.footer_first].into_iter().flatten() {
+            v.extend(d.images.iter().map(|(k, v)| (*k, v)));
+        }
+        v
     }
 
     pub fn pkg_id(&self) -> u64 {

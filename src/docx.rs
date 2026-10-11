@@ -139,6 +139,8 @@ struct Reader<'a> {
     tables: BTreeMap<u32, Table>,
     /// Inline objects found between paragraphs, attached to the next one.
     pending: Vec<(u32, CharFmt)>,
+    /// Image ids are allocated above this value (keeps header images distinct).
+    image_base: u32,
 }
 
 fn push(p: &mut Para, c: char, f: CharFmt) {
@@ -385,7 +387,7 @@ impl Reader<'_> {
                         }
                     }
                     img.raw = Some((raw, self.pkg));
-                    let id = self.images.keys().next_back().copied().unwrap_or(0) + 1;
+                    let id = self.images.keys().next_back().copied().unwrap_or(self.image_base).max(self.image_base) + 1;
                     self.images.insert(id, img);
                     let mut imf = *f;
                     imf.image = id;
@@ -701,6 +703,87 @@ fn hf_text(el: &El) -> (String, bool) {
     (t, page)
 }
 
+/// Parses one header/footer part into a laid-out-able sub-document.
+fn hf_document(
+    parts: &BTreeMap<String, Vec<u8>>,
+    target: &str,
+    pkg_id: u64,
+    sheet: &Arc<StyleSheet>,
+    numbering: &Numbering,
+    image_base: u32,
+) -> Option<Document> {
+    let root = part_xml(parts, target)?;
+    let mut reader = Reader {
+        parts,
+        rels: read_rels(parts, target),
+        sheet,
+        numbering,
+        pkg: pkg_id,
+        images: BTreeMap::new(),
+        tables: BTreeMap::new(),
+        pending: Vec::new(),
+        image_base,
+    };
+    let mut paras = Vec::new();
+    reader.block_children(&root, &mut paras, None, None);
+    // Header tables get ids far away from body tables.
+    let tables: BTreeMap<u32, Table> = std::mem::take(&mut reader.tables).into_iter().map(|(k, v)| (k + image_base, v)).collect();
+    for p in &mut paras {
+        if let Some(c) = &mut p.cell {
+            c.table += image_base;
+        }
+    }
+    if paras.is_empty() {
+        return None;
+    }
+    let mut d = Document::new();
+    d.paras = paras;
+    d.images = std::mem::take(&mut reader.images);
+    d.tables = tables;
+    d.numbering = numbering.clone();
+    d.styles = sheet.clone();
+    Some(d)
+}
+
+/// Rich headers and footers referenced by a body `w:sectPr`.
+pub fn hf_from_parts(
+    parts: &BTreeMap<String, Vec<u8>>,
+    sect_xml: Option<&str>,
+    pkg_id: u64,
+    sheet: &Arc<StyleSheet>,
+    numbering: &Numbering,
+) -> crate::doc::HeaderFooter {
+    let mut hf = crate::doc::HeaderFooter::default();
+    let Some(sect) = sect_xml.and_then(|s| xml::parse(s).ok()) else { return hf };
+    let main = read_rels(parts, "")
+        .values()
+        .find(|r| r.kind == "officeDocument")
+        .map(|r| r.target.clone())
+        .unwrap_or_else(|| "word/document.xml".into());
+    let rels = read_rels(parts, &main);
+    hf.title_page = sect.child("titlePg").is_some_and(styles::on);
+    let mut base = 1_000_000;
+    for e in sect.elems() {
+        let is_header = match e.name.as_str() {
+            "headerReference" => true,
+            "footerReference" => false,
+            _ => continue,
+        };
+        let Some(target) = e.attr("id").and_then(|id| rels.get(id)).map(|r| r.target.clone()) else { continue };
+        let Some(d) = hf_document(parts, &target, pkg_id, sheet, numbering, base) else { continue };
+        base += 1_000_000;
+        let slot = match (is_header, e.attr("type").unwrap_or("default")) {
+            (true, "first") => &mut hf.header_first,
+            (true, "default") => &mut hf.header,
+            (false, "first") => &mut hf.footer_first,
+            (false, "default") => &mut hf.footer,
+            _ => continue,
+        };
+        *slot = Some(Box::new(d));
+    }
+    hf
+}
+
 /// Style sheet of a stored .docx package.
 pub fn sheet_from_parts(parts: &BTreeMap<String, Vec<u8>>) -> StyleSheet {
     let main = read_rels(parts, "")
@@ -776,6 +859,7 @@ pub fn load_docx_bytes(bytes: &[u8]) -> Result<Document, String> {
         images: BTreeMap::new(),
         tables: BTreeMap::new(),
         pending: Vec::new(),
+        image_base: 0,
     };
     let mut paras = Vec::new();
     let body = root.child("body");
@@ -834,6 +918,7 @@ pub fn load_docx_bytes(bytes: &[u8]) -> Result<Document, String> {
     doc.tables = tables;
     doc.numbering = numbering;
     doc.styles = Arc::new(sheet);
+    doc.hf = hf_from_parts(&pkg.parts, pkg.body_sect.as_deref(), pkg_id, &doc.styles, &doc.numbering);
     doc.pkg = Some(Arc::new(pkg));
     if !paras.is_empty() {
         doc.paras = paras;

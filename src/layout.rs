@@ -75,6 +75,90 @@ pub struct Layout {
     pub header: (String, f32),
     /// Footer text and width for each page.
     pub footers: Vec<(String, f32)>,
+    /// Rich header/footer layouts: header, first-page header, footer, first-page footer.
+    pub hf: [Option<Box<Layout>>; 4],
+    /// Vertical offset at which each rich header/footer layout is drawn.
+    pub hf_dy: [f32; 4],
+    /// Whether rich (laid out) headers / footers are used instead of plain text.
+    pub rich_header: bool,
+    pub rich_footer: bool,
+    /// PAGE / NUMPAGES field results: (paragraph, start, end, is NUMPAGES).
+    pub page_fields: Vec<(usize, usize, usize, bool)>,
+}
+
+/// Which rich header/footer variant (index into `Layout::hf`) applies to a page.
+pub fn hf_variant(doc: &Document, header: bool, page: usize) -> Option<usize> {
+    let (default, first, base) = if header {
+        (&doc.hf.header, &doc.hf.header_first, 0)
+    } else {
+        (&doc.hf.footer, &doc.hf.footer_first, 2)
+    };
+    if page == 0 && doc.hf.title_page {
+        return first.is_some().then_some(base + 1);
+    }
+    default.is_some().then_some(base)
+}
+
+/// Finds the results of PAGE and NUMPAGES fields.
+fn find_page_fields(doc: &Document) -> Vec<(usize, usize, usize, bool)> {
+    let mut out = Vec::new();
+    for (pi, p) in doc.paras.iter().enumerate() {
+        let mut instr = String::new();
+        let mut result_start: Option<(usize, bool)> = None;
+        let mut in_instr = false;
+        for (ci, f) in p.fmts.iter().enumerate() {
+            let Some(o) = pool::obj(f.obj) else { continue };
+            match o.kind {
+                ObjKind::FieldBegin => {
+                    instr.clear();
+                    in_instr = true;
+                    result_start = None;
+                }
+                ObjKind::Hidden if in_instr && o.xml.contains("instrText") => {
+                    if let Ok(el) = crate::xml::parse(&o.xml) {
+                        instr.push_str(&el.run_text());
+                    }
+                }
+                ObjKind::FieldSep => {
+                    in_instr = false;
+                    let first = instr.split_whitespace().next().unwrap_or("").to_ascii_uppercase();
+                    if first == "PAGE" || first == "NUMPAGES" || first == "SECTIONPAGES" {
+                        result_start = Some((ci + 1, first != "PAGE"));
+                    }
+                }
+                ObjKind::FieldEnd => {
+                    if let Some((s, total)) = result_start.take() {
+                        if ci > s {
+                            out.push((pi, s, ci, total));
+                        }
+                    }
+                    in_instr = false;
+                }
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
+/// Lays out a header/footer sub-document across the page width.
+fn hf_layout(main: &Document, sub: &Document, fonts: &mut FontsView<'_>, zoom: f32, top: f32) -> Box<Layout> {
+    let mut d = sub.clone();
+    d.page = main.page.clone();
+    d.page.height = 20000.0;
+    d.page.margins = [top, main.page.margins[1], 0.0, main.page.margins[3]];
+    d.header.clear();
+    d.footer.clear();
+    d.page_numbers = false;
+    d.hf = Default::default();
+    Box::new(layout(&d, fonts, zoom))
+}
+
+/// Height of the content of a header/footer layout below its top margin.
+fn content_height(l: &Layout) -> f32 {
+    let lines = l.lines.iter().map(|x| x.y + x.height).fold(0.0f32, f32::max);
+    let cells = l.cells.iter().map(|c| c.y + c.h).fold(0.0f32, f32::max);
+    (lines.max(cells) - l.margins[0]).max(0.0)
 }
 
 /// Format used for header and footer text.
@@ -524,7 +608,36 @@ pub fn layout(doc: &Document, fonts: &mut FontsView<'_>, zoom: f32) -> Layout {
     let sc = zoom * PT_TO_PX;
     let pw = doc.page.width * sc;
     let ph = doc.page.height * sc;
-    let [mt, mr, mb, ml] = doc.page.margins.map(|m| m * sc);
+    let [mut mt, mr, mut mb, ml] = doc.page.margins.map(|m| m * sc);
+
+    // Rich headers and footers; the body moves down/up if they don't fit in the margins.
+    let rich_header = doc.pkg.as_ref().is_some_and(|p| p.header_text == doc.header)
+        && (doc.hf.header.is_some() || doc.hf.header_first.is_some());
+    let rich_footer = doc.pkg.as_ref().is_some_and(|p| p.footer_text == doc.footer && p.page_numbers == doc.page_numbers)
+        && (doc.hf.footer.is_some() || doc.hf.footer_first.is_some());
+    let mut hf: [Option<Box<Layout>>; 4] = [None, None, None, None];
+    let mut hf_dy = [0.0f32; 4];
+    let subs = [&doc.hf.header, &doc.hf.header_first, &doc.hf.footer, &doc.hf.footer_first];
+    for (i, sub) in subs.into_iter().enumerate() {
+        let is_header = i < 2;
+        if (is_header && !rich_header) || (!is_header && !rich_footer) {
+            continue;
+        }
+        let Some(sub) = sub else { continue };
+        if is_header {
+            let l = hf_layout(doc, sub, fonts, zoom, doc.page.header_dist);
+            let bottom = doc.page.header_dist * sc + content_height(&l);
+            mt = mt.max(bottom + 4.0 * sc);
+            hf[i] = Some(l);
+        } else {
+            let l = hf_layout(doc, sub, fonts, zoom, 0.0);
+            let h = content_height(&l);
+            hf_dy[i] = ph - doc.page.footer_dist * sc - h;
+            mb = mb.max(doc.page.footer_dist * sc + h + 4.0 * sc);
+            hf[i] = Some(l);
+        }
+    }
+
     let labels = doc.list_labels();
     let mut ctx = Ctx {
         fonts,
@@ -690,8 +803,8 @@ pub fn layout(doc: &Document, fonts: &mut FontsView<'_>, zoom: f32) -> Layout {
         .into_iter()
         .map(|b| b.unwrap_or(ParaBox { lines: 0..0, left: ml, right: pw - mr, marker: None }))
         .collect();
-    let hf = hf_fmt();
-    let header = (doc.header.clone(), ctx.text_width(&hf, &doc.header));
+    let hff = hf_fmt();
+    let header = (doc.header.clone(), ctx.text_width(&hff, &doc.header));
     let footers = (0..pages)
         .map(|pg| {
             let mut s = doc.footer.clone();
@@ -701,7 +814,7 @@ pub fn layout(doc: &Document, fonts: &mut FontsView<'_>, zoom: f32) -> Layout {
                 }
                 s.push_str(&format!("Page {} of {}", pg + 1, pages));
             }
-            let w = ctx.text_width(&hf, &s);
+            let w = ctx.text_width(&hff, &s);
             (s, w)
         })
         .collect();
@@ -719,6 +832,11 @@ pub fn layout(doc: &Document, fonts: &mut FontsView<'_>, zoom: f32) -> Layout {
         obj_text: ctx.obj_text,
         header,
         footers,
+        hf,
+        hf_dy,
+        rich_header,
+        rich_footer,
+        page_fields: find_page_fields(doc),
     }
 }
 

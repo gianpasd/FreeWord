@@ -491,7 +491,7 @@ impl App {
 
     fn texture(&mut self, ctx: &egui::Context, id: u32) -> Option<egui::TextureId> {
         if !self.textures.contains_key(&id) {
-            let img = self.doc.images.get(&id)?;
+            let img = self.doc.all_images().into_iter().find(|(k, _)| *k == id).map(|(_, v)| v.clone())?;
             let rgba = image::load_from_memory(&img.bytes).ok()?.to_rgba8();
             let size = [rgba.width() as usize, rgba.height() as usize];
             let ci = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
@@ -515,7 +515,7 @@ impl App {
             self.refresh_find();
         }
         let matches = if self.find.open { self.find.matches.clone() } else { Vec::new() };
-        let ids: Vec<u32> = self.doc.images.keys().copied().collect();
+        let ids: Vec<u32> = self.doc.all_images().into_iter().map(|(k, _)| k).collect();
         for id in ids {
             self.texture(ui.ctx(), id);
         }
