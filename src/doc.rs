@@ -287,6 +287,82 @@ pub struct CellRef {
     pub col: u32,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub enum BorderKind {
+    None,
+    Single,
+    Double,
+    Dotted,
+    Dashed,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
+pub struct Border {
+    pub kind: BorderKind,
+    /// Line width in points.
+    pub width: f32,
+    pub color: Rgba,
+    /// Distance from the text in points (paragraph borders).
+    pub space: f32,
+}
+
+impl Border {
+    pub fn single() -> Self {
+        Border { kind: BorderKind::Single, width: 0.5, color: BLACK, space: 0.0 }
+    }
+
+    pub fn visible(b: &Option<Border>) -> bool {
+        b.is_some_and(|b| b.kind != BorderKind::None && b.width > 0.0)
+    }
+}
+
+/// Border set of a table, cell or paragraph. `None` = not specified;
+/// `Some(kind: None)` = explicitly no border.
+#[derive(Clone, Copy, PartialEq, Debug, Default, Serialize, Deserialize)]
+pub struct Edges {
+    pub top: Option<Border>,
+    pub left: Option<Border>,
+    pub bottom: Option<Border>,
+    pub right: Option<Border>,
+    /// Between rows (tables) / between paragraphs (paragraph borders).
+    pub inside_h: Option<Border>,
+    pub inside_v: Option<Border>,
+}
+
+impl Edges {
+    pub fn all(b: Border) -> Self {
+        Edges { top: Some(b), left: Some(b), bottom: Some(b), right: Some(b), inside_h: Some(b), inside_v: Some(b) }
+    }
+
+    /// Overrides specified edges with those of `o`.
+    pub fn merge(&mut self, o: &Edges) {
+        for (dst, src) in [
+            (&mut self.top, o.top),
+            (&mut self.left, o.left),
+            (&mut self.bottom, o.bottom),
+            (&mut self.right, o.right),
+            (&mut self.inside_h, o.inside_h),
+            (&mut self.inside_v, o.inside_v),
+        ] {
+            if src.is_some() {
+                *dst = src;
+            }
+        }
+    }
+
+    pub fn any_visible(&self) -> bool {
+        [self.top, self.left, self.bottom, self.right, self.inside_h, self.inside_v].iter().any(Border::visible)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize, Default)]
+pub enum VAlign {
+    #[default]
+    Top,
+    Center,
+    Bottom,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize, Default)]
 pub enum VMerge {
     #[default]
@@ -303,6 +379,17 @@ pub struct CellProps {
     /// Original `w:tcPr` XML, written back with span/merge/shading patched.
     #[serde(default)]
     pub tcpr_raw: Option<String>,
+    /// Resolved display borders (table, style and cell borders combined): top, right, bottom, left.
+    #[serde(default)]
+    pub edges: [Option<Border>; 4],
+    /// Shading coming from the table style (display only).
+    #[serde(default)]
+    pub style_shade: Option<Rgba>,
+    /// Cell margins (top, left, bottom, right) in points, if set on the cell.
+    #[serde(default)]
+    pub margins: Option<[f32; 4]>,
+    #[serde(default)]
+    pub valign: VAlign,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -315,7 +402,7 @@ pub struct RowProps {
     pub trpr_raw: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Table {
     /// Column widths in points.
     pub grid: Vec<f32>,
@@ -333,6 +420,44 @@ pub struct Table {
     /// Paragraph that holds this table when it is nested in another table's cell.
     #[serde(default)]
     pub nested_raw: bool,
+    /// Borders resolved from the table style and `w:tblBorders` (None = use `borders`).
+    #[serde(default)]
+    pub edges: Option<Edges>,
+    /// Default cell margins (top, left, bottom, right) in points.
+    #[serde(default = "default_cell_margins")]
+    pub cell_margins: [f32; 4],
+}
+
+fn default_cell_margins() -> [f32; 4] {
+    [0.0, 5.4, 0.0, 5.4]
+}
+
+impl Default for Table {
+    fn default() -> Self {
+        Table {
+            grid: Vec::new(),
+            borders: false,
+            indent: 0.0,
+            align: None,
+            cells: BTreeMap::new(),
+            rows: BTreeMap::new(),
+            tblpr_raw: None,
+            nested_raw: false,
+            edges: None,
+            cell_margins: default_cell_margins(),
+        }
+    }
+}
+
+impl Table {
+    /// Display borders of the whole table.
+    pub fn display_edges(&self) -> Edges {
+        match (&self.edges, self.tblpr_raw.is_some()) {
+            (Some(e), true) => *e,
+            _ if self.borders => Edges::all(Border::single()),
+            _ => Edges::default(),
+        }
+    }
 }
 
 impl Table {
@@ -367,6 +492,8 @@ pub struct Para {
     pub ind_first: f32,
     pub tabs: Vec<TabStop>,
     pub shading: Rgba,
+    /// Paragraph borders for display (the XML lives in the style or `ppr_extra`).
+    pub borders: Edges,
     pub page_break_before: bool,
     /// A section ends with this paragraph (raw `w:sectPr` lives in `ppr_extra`).
     pub sect_break: bool,
@@ -402,6 +529,7 @@ impl Para {
             ind_first: 0.0,
             tabs: Vec::new(),
             shading: NO_COLOR,
+            borders: Edges::default(),
             page_break_before: false,
             sect_break: false,
             ppr_extra: String::new(),
@@ -561,7 +689,9 @@ pub struct HeaderFooter {
 #[derive(Clone, Debug)]
 pub struct Document {
     pub paras: Vec<Para>,
-    pub hf: HeaderFooter,
+    pub hf: Arc<HeaderFooter>,
+    /// Footnote (false) and endnote (true) texts by w:id.
+    pub notes: Arc<BTreeMap<(bool, String), Document>>,
     pub page: PageSetup,
     pub header: String,
     pub footer: String,
@@ -594,7 +724,8 @@ impl Document {
     pub fn new() -> Self {
         Document {
             paras: vec![Para::new(Style::Normal)],
-            hf: HeaderFooter::default(),
+            hf: Arc::new(HeaderFooter::default()),
+            notes: Arc::new(BTreeMap::new()),
             page: PageSetup::default(),
             header: String::new(),
             footer: String::new(),
@@ -1046,6 +1177,7 @@ impl Document {
             p.ind_first = pp.ind_first;
             p.tabs = pp.tabs;
             p.shading = pp.shading;
+            p.borders = pp.borders;
             match pp.num {
                 Some((n, l)) => {
                     p.num_id = n;

@@ -207,6 +207,40 @@ try {
     $s.Font.Hidden = 1; $s.TypeText("hidden text"); $s.Font.Hidden = 0
     $s.TypeParagraph()
     Save-Doc $d "08_advanced.docx"
+
+    # 9. Table styles, banding, cell borders/alignment, paragraph borders
+    $d = New-Doc; $s = $word.Selection
+    Para $s "Styled tables" "Heading 1"
+    $s.Style = "Normal"
+    $t = $d.Tables.Add($s.Range, 5, 4)
+    try { $t.Style = "Grid Table 4 - Accent 1" } catch { $t.Style = "Table Grid" }
+    $t.ApplyStyleHeadingRows = $true
+    $t.ApplyStyleRowBands = $true
+    $t.ApplyStyleFirstColumn = $true
+    for ($r = 1; $r -le 5; $r++) { for ($c = 1; $c -le 4; $c++) { $t.Cell($r, $c).Range.Text = if ($r -eq 1) { "Head $c" } else { "R$r C$c" } } }
+    $s.EndKey(6) | Out-Null
+    $s.TypeParagraph()
+    $t2 = $d.Tables.Add($s.Range, 2, 3)
+    $t2.Borders.Enable = $false
+    $t2.Rows.Item(1).Height = 40
+    $t2.Cell(1, 1).Range.Text = "Top"
+    $t2.Cell(1, 2).Range.Text = "Middle"
+    $t2.Cell(1, 2).VerticalAlignment = 1
+    $t2.Cell(1, 3).Range.Text = "Bottom"
+    $t2.Cell(1, 3).VerticalAlignment = 3
+    $b = $t2.Cell(2, 2).Borders.Item(-3)
+    $b.LineStyle = 7; $b.LineWidth = 12; $b.Color = 255
+    $t2.Cell(2, 2).Range.Text = "Double red bottom border"
+    $s.EndKey(6) | Out-Null
+    $s.TypeParagraph()
+    $s.TypeText("A boxed paragraph with a shaded background.")
+    $s.ParagraphFormat.Borders.Enable = $true
+    $s.ParagraphFormat.Shading.BackgroundPatternColor = 14348258
+    $s.TypeParagraph()
+    $s.ParagraphFormat.Borders.Enable = $false
+    $s.ParagraphFormat.Shading.BackgroundPatternColor = -16777216
+    Para $s "Plain paragraph after the box."
+    Save-Doc $d "09_table_styles.docx"
 }
 finally {
     $word.Quit()

@@ -153,6 +153,12 @@ pub fn convert(input: &Path, output: &Path) -> Result<(), String> {
     let mut out = ctx.run_ui(egui::RawInput::default(), |_| {});
     out.textures_delta.clear();
     let doc = load_any(input)?;
+    // Load the fonts the document uses, then let egui pick them up.
+    if crate::fonts::request(&ctx, crate::fonts::used_by(&doc)) {
+        let mut out = ctx.run_ui(egui::RawInput::default(), |_| {});
+        out.textures_delta.clear();
+        crate::fonts::commit();
+    }
     let ext = output.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
     match ext.as_str() {
         "pdf" => {
@@ -650,12 +656,7 @@ impl App {
             let tm = self.doc.tables.get_mut(&cur.table).unwrap();
             tm.cells.insert(
                 (new_row, *c),
-                crate::doc::CellProps {
-                    span: props.span,
-                    shade: props.shade,
-                    tcpr_raw: props.tcpr_raw.clone(),
-                    vmerge: crate::doc::VMerge::None,
-                },
+                crate::doc::CellProps { vmerge: crate::doc::VMerge::None, ..props.clone() },
             );
         }
         let at = if below { last + 1 } else { first };
@@ -1463,6 +1464,7 @@ impl App {
     // ------------------------------------------------------------ files
 
     fn reset_with(&mut self, doc: Document, path: Option<PathBuf>) {
+        crate::fonts::request(&self.ctx, crate::fonts::used_by(&doc));
         self.doc = doc;
         self.path = path;
         self.dirty = false;

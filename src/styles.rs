@@ -4,7 +4,7 @@
 //! .docx is written, formatting is emitted as the *difference* from what the
 //! paragraph/character style already provides, so styles keep working in Word.
 
-use crate::doc::{Align, CharFmt, Leader, LineRule, Rgba, TabKind, TabStop, BLACK, NO_COLOR};
+use crate::doc::{Align, Border, BorderKind, CharFmt, Edges, Leader, LineRule, Rgba, TabKind, TabStop, BLACK, NO_COLOR};
 use crate::fonts;
 use crate::numbering::Numbering;
 use crate::xml::{self, El};
@@ -19,6 +19,9 @@ pub struct StyleDef {
     pub ppr: Option<El>,
     pub rpr: Option<El>,
     pub tblpr: Option<El>,
+    pub tcpr: Option<El>,
+    /// Conditional table formatting (`w:tblStylePr`) by type.
+    pub cond: Vec<(String, El)>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -49,6 +52,7 @@ pub struct PProps {
     pub tabs: Vec<TabStop>,
     pub shading: Rgba,
     pub page_break_before: bool,
+    pub borders: Edges,
 }
 
 impl Default for PProps {
@@ -67,6 +71,7 @@ impl Default for PProps {
             tabs: Vec::new(),
             shading: NO_COLOR,
             page_break_before: false,
+            borders: Edges::default(),
         }
     }
 }
@@ -105,6 +110,77 @@ pub fn on(e: &El) -> bool {
 
 fn twips(e: &El, key: &str) -> Option<f32> {
     e.attr(key).and_then(|v| v.parse::<f32>().ok()).map(|v| v / 20.0)
+}
+
+/// Parses a border element (`w:top`, `w:insideH`, ...).
+pub fn parse_border(e: &El) -> Border {
+    let kind = match e.attr("val") {
+        None | Some("nil" | "none") => BorderKind::None,
+        Some("double" | "triple" | "thinThickSmallGap" | "thickThinSmallGap" | "thinThickMediumGap" | "thickThinMediumGap" | "thinThickLargeGap" | "thickThinLargeGap") => BorderKind::Double,
+        Some("dotted" | "dotDash" | "dotDotDash") => BorderKind::Dotted,
+        Some("dashed" | "dashSmallGap" | "dashDotStroked") => BorderKind::Dashed,
+        _ => BorderKind::Single,
+    };
+    // w:sz is in eighths of a point.
+    let width = e.attr("sz").and_then(|v| v.parse::<f32>().ok()).map(|v| (v / 8.0).max(0.25)).unwrap_or(0.5);
+    let color = match e.attr("color") {
+        Some("auto") | None => BLACK,
+        Some(c) => parse_hex(c).unwrap_or(BLACK),
+    };
+    let space = e.attr("space").and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.0);
+    Border { kind, width, color, space }
+}
+
+/// Parses `w:tblBorders` / `w:tcBorders` / `w:pBdr`.
+pub fn parse_edges(e: &El) -> Edges {
+    let mut ed = Edges::default();
+    for c in e.elems() {
+        let b = Some(parse_border(c));
+        match c.name.as_str() {
+            "top" => ed.top = b,
+            "left" | "start" => ed.left = b,
+            "bottom" => ed.bottom = b,
+            "right" | "end" => ed.right = b,
+            "insideH" | "between" => ed.inside_h = b,
+            "insideV" => ed.inside_v = b,
+            _ => {}
+        }
+    }
+    ed
+}
+
+/// Cell margins from `w:tblCellMar` / `w:tcMar` applied over `m` (top, left, bottom, right).
+pub fn parse_margins(e: &El, m: &mut [f32; 4]) {
+    for c in e.elems() {
+        let Some(v) = c.attr("w").and_then(|v| v.parse::<f32>().ok()) else { continue };
+        if c.attr("type").is_some_and(|t| t != "dxa") {
+            continue;
+        }
+        let v = v / 20.0;
+        match c.name.as_str() {
+            "top" => m[0] = v,
+            "left" | "start" => m[1] = v,
+            "bottom" => m[2] = v,
+            "right" | "end" => m[3] = v,
+            _ => {}
+        }
+    }
+}
+
+/// Table-level formatting resolved from a table style chain.
+#[derive(Clone, Debug, Default)]
+pub struct TableStyle {
+    pub edges: Edges,
+    pub cell_margins: Option<[f32; 4]>,
+    /// Shading of the whole table (style `w:tcPr`).
+    pub shade: Option<Rgba>,
+    /// Conditional formats by type, root style first.
+    pub cond: Vec<(String, El)>,
+    pub row_band: u32,
+    pub col_band: u32,
+    /// Paragraph/run properties of the style itself.
+    pub ppr: Vec<El>,
+    pub rpr: Vec<El>,
 }
 
 /// Shading fill color, if any.
@@ -146,6 +222,12 @@ impl StyleSheet {
                 ppr: s.child("pPr").cloned(),
                 rpr: s.child("rPr").cloned(),
                 tblpr: s.child("tblPr").cloned(),
+                tcpr: s.child("tcPr").cloned(),
+                cond: s
+                    .elems()
+                    .filter(|e| e.name == "tblStylePr")
+                    .map(|e| (e.attr("type").unwrap_or("").to_string(), e.clone()))
+                    .collect(),
             };
             if kind == "paragraph" && s.attr("default").is_some_and(|v| v == "1" || v == "true") {
                 sh.default_para = Some(id.to_string());
@@ -370,6 +452,7 @@ impl StyleSheet {
                     }
                 }
                 "contextualSpacing" => p.contextual = on(e),
+                "pBdr" => p.borders.merge(&parse_edges(e)),
                 "pageBreakBefore" => p.page_break_before = on(e),
                 "shd" => p.shading = shd_fill(e).unwrap_or(NO_COLOR),
                 "tabs" => {
@@ -416,13 +499,43 @@ impl StyleSheet {
         p
     }
 
-    /// Whether a table style draws borders.
-    pub fn table_style_has_borders(&self, id: &str) -> bool {
-        for d in self.chain(Some(id)).iter().rev() {
-            if let Some(b) = d.tblpr.as_ref().and_then(|t| t.child("tblBorders")) {
-                return b.elems().any(|x| !matches!(x.attr("val"), Some("nil" | "none")));
+    /// Resolves a table style chain (borders, margins, shading, conditional formats).
+    pub fn table_style(&self, id: Option<&str>) -> TableStyle {
+        let mut ts = TableStyle { row_band: 1, col_band: 1, ..Default::default() };
+        let id = id.or_else(|| {
+            self.styles.values().find(|s| s.kind == "table" && s.id == "TableNormal").map(|s| s.id.as_str())
+        });
+        for d in self.chain(id) {
+            if let Some(t) = &d.tblpr {
+                if let Some(b) = t.child("tblBorders") {
+                    ts.edges.merge(&parse_edges(b));
+                }
+                if let Some(m) = t.child("tblCellMar") {
+                    let mut mm = ts.cell_margins.unwrap_or([0.0, 5.4, 0.0, 5.4]);
+                    parse_margins(m, &mut mm);
+                    ts.cell_margins = Some(mm);
+                }
+                if let Some(v) = t.child_val("tblStyleRowBandSize").and_then(|v| v.parse().ok()) {
+                    ts.row_band = v;
+                }
+                if let Some(v) = t.child_val("tblStyleColBandSize").and_then(|v| v.parse().ok()) {
+                    ts.col_band = v;
+                }
             }
+            if let Some(s) = d.tcpr.as_ref().and_then(|t| t.child("shd")).and_then(shd_fill) {
+                ts.shade = Some(s);
+            }
+            if let Some(p) = &d.ppr {
+                ts.ppr.push(p.clone());
+            }
+            if let Some(r) = &d.rpr {
+                ts.rpr.push(r.clone());
+            }
+            ts.cond.extend(d.cond.iter().cloned());
         }
-        false
+        ts.row_band = ts.row_band.max(1);
+        ts.col_band = ts.col_band.max(1);
+        ts
     }
+
 }

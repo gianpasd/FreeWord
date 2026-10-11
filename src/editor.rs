@@ -580,7 +580,7 @@ impl App {
                 painter.line_segment([c, c + vec2(0.0, dy * 12.0)], guide);
             }
             // Gridlines for borderless tables, like Word's "View Gridlines".
-            for cell in lay.cells.iter().filter(|c| c.page == page && !c.borders) {
+            for cell in lay.cells.iter().filter(|c| c.page == page && !c.edges.iter().any(crate::doc::Border::visible)) {
                 let r = Rect::from_min_size(o + vec2(cell.x, cell.y), vec2(cell.w, cell.h));
                 painter.rect_stroke(r, 0.0, Stroke::new(1.0, Color32::from_rgb(0xC8, 0xD8, 0xEE)), StrokeKind::Inside);
             }

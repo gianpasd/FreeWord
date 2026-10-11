@@ -16,8 +16,6 @@ use std::ops::Range;
 pub const PT_TO_PX: f32 = 96.0 / 72.0;
 const SCRIPT_SCALE: f32 = 0.65;
 const SMALL_CAPS_SCALE: f32 = 0.8;
-/// Default left/right cell margin (0.08").
-const CELL_MARGIN_PT: f32 = 5.4;
 
 pub struct Line {
     pub para: usize,
@@ -53,9 +51,8 @@ pub struct CellBox {
     pub w: f32,
     pub h: f32,
     pub shade: Option<Rgba>,
-    pub borders: bool,
-    /// Vertically merged into the cell above (no top border).
-    pub merged_above: bool,
+    /// top, right, bottom, left
+    pub edges: [Option<doc::Border>; 4],
 }
 
 pub struct Layout {
@@ -686,9 +683,12 @@ pub fn layout(doc: &Document, fonts: &mut FontsView<'_>, zoom: f32) -> Layout {
             let x0 = match table.align {
                 Some(Align::Center) => ml + (avail - tw) / 2.0,
                 Some(Align::Right) => pw - mr - tw,
-                _ => ml + table.indent * sc - CELL_MARGIN_PT * sc,
+                _ => ml + table.indent * sc - table.cell_margins[1] * sc,
             };
             let col_x = |col: u32| x0 + widths.iter().take(col as usize).sum::<f32>();
+            let tedges = table.display_edges();
+            let ncols = table.grid.len().max(1) as u32;
+            let last_row = doc.paras[range.end - 1].cell.unwrap().row;
             let mut k = range.start;
             while k < range.end {
                 let row = doc.paras[k].cell.unwrap().row;
@@ -698,12 +698,13 @@ pub fn layout(doc: &Document, fonts: &mut FontsView<'_>, zoom: f32) -> Layout {
                 while k < range.end && doc.paras[k].cell.unwrap().row == row {
                     let cref = doc.paras[k].cell.unwrap();
                     let cp = table.cell(cref.row, cref.col);
+                    let m = cp.margins.unwrap_or(table.cell_margins);
                     let cx = col_x(cref.col);
                     let cw: f32 = widths.iter().skip(cref.col as usize).take(cp.span.max(1) as usize).sum();
-                    let inner_l = cx + CELL_MARGIN_PT * sc;
-                    let inner_r = (cx + cw - CELL_MARGIN_PT * sc).max(inner_l + 4.0);
+                    let inner_l = cx + m[1] * sc;
+                    let inner_r = (cx + cw - m[3] * sc).max(inner_l + 4.0);
                     let mut paras_in_cell = Vec::new();
-                    let mut cy = 0.0;
+                    let mut cy = m[0] * sc;
                     let mut prev_after = 0.0;
                     let mut first = true;
                     while k < range.end && doc.paras[k].cell == Some(cref) {
@@ -719,33 +720,58 @@ pub fn layout(doc: &Document, fonts: &mut FontsView<'_>, zoom: f32) -> Layout {
                         first = false;
                         k += 1;
                     }
+                    cy += prev_after + m[2] * sc;
                     let content_h = if cp.vmerge == VMerge::Continue { 0.0 } else { cy };
                     row_cells.push((cref, paras_in_cell, content_h));
                 }
-                let mut row_h = row_cells.iter().map(|c| c.2).fold(0.0f32, f32::max) + 2.0 * sc;
+                let mut row_h = row_cells.iter().map(|c| c.2).fold(0.0f32, f32::max).max(4.0 * sc);
                 if row_props.height > 0.0 {
                     row_h = if row_props.exact { row_props.height * sc } else { row_h.max(row_props.height * sc) };
                 }
                 let (page, top) = pager.place(row_h);
-                for (cref, paras_in_cell, _) in row_cells {
+                for (cref, paras_in_cell, content_h) in row_cells {
                     let cp = table.cell(cref.row, cref.col);
+                    let span = cp.span.max(1);
                     let cx = col_x(cref.col);
-                    let cw: f32 = widths.iter().skip(cref.col as usize).take(cp.span.max(1) as usize).sum();
+                    let cw: f32 = widths.iter().skip(cref.col as usize).take(span as usize).sum();
+                    // Imported cells carry resolved edges; generated tables use the table's.
+                    let mut edges = if cp.edges.iter().any(|e| e.is_some()) {
+                        cp.edges
+                    } else {
+                        [
+                            if cref.row == 0 { tedges.top } else { tedges.inside_h },
+                            if cref.col + span >= ncols { tedges.right } else { tedges.inside_v },
+                            if cref.row == last_row { tedges.bottom } else { tedges.inside_h },
+                            if cref.col == 0 { tedges.left } else { tedges.inside_v },
+                        ]
+                    };
+                    if cp.vmerge == VMerge::Continue {
+                        edges[0] = None;
+                    }
+                    if cp.vmerge != VMerge::None
+                        && table.cells.get(&(cref.row + 1, cref.col)).is_some_and(|n| n.vmerge == VMerge::Continue)
+                    {
+                        edges[2] = None;
+                    }
                     cells.push(CellBox {
                         page,
                         x: cx,
                         y: top,
                         w: cw,
                         h: row_h,
-                        shade: cp.shade,
-                        borders: table.borders,
-                        merged_above: cp.vmerge == VMerge::Continue,
+                        shade: cp.shade.or(cp.style_shade),
+                        edges,
                     });
+                    let dy = match cp.valign {
+                        doc::VAlign::Top => 0.0,
+                        doc::VAlign::Center => ((row_h - content_h) / 2.0).max(0.0),
+                        doc::VAlign::Bottom => (row_h - content_h).max(0.0),
+                    };
                     for (idx, pl, py) in paras_in_cell {
                         let first_line = lines.len();
                         for mut l in pl.lines {
                             l.page = page;
-                            l.y += top + sc + py;
+                            l.y += top + py + dy;
                             lines.push(l);
                         }
                         boxes[idx] = Some(ParaBox { lines: first_line..lines.len(), left: pl.left, right: pl.right, marker: pl.marker });

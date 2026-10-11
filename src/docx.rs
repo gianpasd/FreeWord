@@ -9,7 +9,8 @@
 
 use crate::doc::{
     Align, CellProps, CellRef, CharFmt, COLUMN_BREAK, Document, ImageData, LINE_BREAK, Leader, LineRule,
-    ListKind, OBJ, PAGE_BREAK, Package, PageSetup, Para, RowProps, Style, TabKind, TabStop, Table, VMerge,
+    ListKind, OBJ, PAGE_BREAK, Package, PageSetup, Para, RowProps, Style, TabKind, TabStop, Table, VMerge, Edges,
+    VAlign,
 };
 use crate::fonts;
 use crate::io::{hex, image_from_bytes, image_kind};
@@ -129,6 +130,12 @@ fn part_xml(parts: &BTreeMap<String, Vec<u8>>, name: &str) -> Option<El> {
     xml::parse(s.trim_start_matches('\u{feff}')).ok()
 }
 
+/// Table-style paragraph and run properties that apply inside one cell.
+struct CellFmt {
+    ppr: Vec<El>,
+    rpr: Vec<El>,
+}
+
 struct Reader<'a> {
     parts: &'a BTreeMap<String, Vec<u8>>,
     rels: HashMap<String, Rel>,
@@ -175,7 +182,7 @@ impl Reader<'_> {
         f.rpr_extra = pool::intern(&extra);
     }
 
-    fn paragraph(&mut self, el: &El, cell: Option<CellRef>, tbl_style: Option<&str>) -> Para {
+    fn paragraph(&mut self, el: &El, cell: Option<CellRef>, tbl_style: Option<&CellFmt>) -> Para {
         let ppr = el.child("pPr");
         let style_id = ppr
             .and_then(|p| p.child_val("pStyle"))
@@ -185,14 +192,12 @@ impl Reader<'_> {
         let mut pp = self.sheet.para_props(style_id.as_deref(), self.numbering);
         let mut base = self.sheet.char_fmt(style_id.as_deref(), None);
         // Table style formatting applies to paragraphs using the default style.
-        if let (Some(ts), true) = (tbl_style, is_default_style) {
-            if let Some(def) = self.sheet.styles.get(ts) {
-                if let Some(tp) = &def.ppr {
-                    self.sheet.apply_ppr(tp, &mut pp, self.numbering);
-                }
-                if let Some(tr) = &def.rpr {
-                    self.sheet.apply_rpr(tr, &mut base);
-                }
+        if let (Some(cf), true) = (tbl_style, is_default_style) {
+            for tp in &cf.ppr {
+                self.sheet.apply_ppr(tp, &mut pp, self.numbering);
+            }
+            for tr in &cf.rpr {
+                self.sheet.apply_rpr(tr, &mut base);
             }
         }
         if let Some(ppr) = ppr {
@@ -351,6 +356,11 @@ impl Reader<'_> {
                     };
                     self.push_obj(p, &f, raw_run(c), kind);
                 }
+                // The note's own number at the start of its text.
+                "footnoteRef" | "endnoteRef" => {
+                    let kind = ObjKind::NoteRef { endnote: c.name == "endnoteRef", id: "self".into() };
+                    self.push_obj(p, &f, raw_run(c), kind);
+                }
                 _ => self.push_obj(p, &f, raw_run(c), ObjKind::Hidden),
             }
         }
@@ -443,12 +453,20 @@ impl Reader<'_> {
         let id = self.tables.keys().next_back().copied().unwrap_or(0) + 1;
         let tblpr = el.child("tblPr");
         let tbl_style = tblpr.and_then(|t| t.child_val("tblStyle")).map(|s| s.to_string());
+        let ts = self.sheet.table_style(tbl_style.as_deref());
         let mut t = Table { tblpr_raw: tblpr.map(|x| x.to_xml()), ..Default::default() };
-        let direct_borders = tblpr.and_then(|x| x.child("tblBorders"));
-        t.borders = match direct_borders {
-            Some(b) => b.elems().any(|x| !matches!(x.attr("val"), Some("nil" | "none"))),
-            None => tbl_style.as_deref().is_some_and(|s| self.sheet.table_style_has_borders(s)),
-        };
+        // Borders: style, then direct w:tblBorders.
+        let mut edges = ts.edges;
+        if let Some(b) = tblpr.and_then(|x| x.child("tblBorders")) {
+            edges.merge(&styles::parse_edges(b));
+        }
+        t.borders = edges.any_visible();
+        t.edges = Some(edges);
+        let mut margins = ts.cell_margins.unwrap_or([0.0, 5.4, 0.0, 5.4]);
+        if let Some(m) = tblpr.and_then(|x| x.child("tblCellMar")) {
+            styles::parse_margins(m, &mut margins);
+        }
+        t.cell_margins = margins;
         if let Some(ind) = tblpr.and_then(|x| x.child("tblInd")) {
             if ind.attr("type").is_none_or(|ty| ty == "dxa") {
                 t.indent = twips_attr(ind, "w").unwrap_or(0.0);
@@ -462,8 +480,29 @@ impl Reader<'_> {
         if let Some(grid) = el.child("tblGrid") {
             t.grid = grid.elems().filter(|g| g.name == "gridCol").map(|g| twips_attr(g, "w").unwrap_or(72.0)).collect();
         }
+        // Which conditional formats are enabled (w:tblLook).
+        let look = tblpr.and_then(|x| x.child("tblLook"));
+        let flag = |name: &str, bit: u32, default: bool| -> bool {
+            let Some(l) = look else { return default };
+            if let Some(v) = l.attr(name) {
+                return v == "1" || v == "true";
+            }
+            match l.attr("val").and_then(|v| u32::from_str_radix(v, 16).ok()) {
+                Some(bits) => bits & bit != 0,
+                None => default,
+            }
+        };
+        let first_row = flag("firstRow", 0x0020, true);
+        let last_row = flag("lastRow", 0x0040, false);
+        let first_col = flag("firstColumn", 0x0080, true);
+        let last_col = flag("lastColumn", 0x0100, false);
+        let h_band = !flag("noHBand", 0x0200, false);
+        let v_band = !flag("noVBand", 0x0400, true);
+
         let mut rows: Vec<&El> = Vec::new();
         collect_named(el, "tr", &["sdt", "sdtContent", "customXml"], &mut rows);
+        let nrows = rows.len() as u32;
+        let ncols = t.grid.len().max(1) as u32;
         let mut max_col = 0u32;
         for (ri, tr) in rows.iter().enumerate() {
             let ri = ri as u32;
@@ -489,14 +528,94 @@ impl Reader<'_> {
                     Some(_) => VMerge::Continue,
                     None => VMerge::None,
                 };
+                // Conditional regions this cell belongs to, lowest priority first.
+                let body_row = ri.saturating_sub(first_row as u32);
+                let body_col = col.saturating_sub(first_col as u32);
+                let in_first_row = first_row && ri == 0;
+                let in_last_row = last_row && ri + 1 == nrows;
+                let in_first_col = first_col && col == 0;
+                let in_last_col = last_col && col + span >= ncols;
+                let mut regions: Vec<&str> = vec!["wholeTable"];
+                if v_band && !in_first_col && !in_last_col {
+                    regions.push(if (body_col / ts.col_band) % 2 == 0 { "band1Vert" } else { "band2Vert" });
+                }
+                if h_band && !in_first_row && !in_last_row {
+                    regions.push(if (body_row / ts.row_band) % 2 == 0 { "band1Horz" } else { "band2Horz" });
+                }
+                for (on, name) in [
+                    (in_first_col, "firstCol"),
+                    (in_last_col, "lastCol"),
+                    (in_first_row, "firstRow"),
+                    (in_last_row, "lastRow"),
+                    (in_first_row && in_first_col, "nwCell"),
+                    (in_first_row && in_last_col, "neCell"),
+                    (in_last_row && in_first_col, "swCell"),
+                    (in_last_row && in_last_col, "seCell"),
+                ] {
+                    if on {
+                        regions.push(name);
+                    }
+                }
+                // Cell borders: table edges by position, then style regions, then w:tcBorders.
+                let mut ce = Edges {
+                    top: if ri == 0 { edges.top } else { edges.inside_h },
+                    bottom: if ri + 1 == nrows { edges.bottom } else { edges.inside_h },
+                    left: if col == 0 { edges.left } else { edges.inside_v },
+                    right: if col + span >= ncols { edges.right } else { edges.inside_v },
+                    ..Default::default()
+                };
+                let mut style_shade = ts.shade;
+                let mut cell_fmt = CellFmt { ppr: ts.ppr.clone(), rpr: ts.rpr.clone() };
+                for region in &regions {
+                    for (_, cond) in ts.cond.iter().filter(|(ty, _)| ty == region) {
+                        if let Some(tcp) = cond.child("tcPr") {
+                            if let Some(b) = tcp.child("tcBorders") {
+                                let be = styles::parse_edges(b);
+                                ce.merge(&Edges { inside_h: None, inside_v: None, ..be });
+                            }
+                            if let Some(s) = tcp.child("shd") {
+                                style_shade = styles::shd_fill(s);
+                            }
+                        }
+                        if let Some(p) = cond.child("pPr") {
+                            cell_fmt.ppr.push(p.clone());
+                        }
+                        if let Some(rr) = cond.child("rPr") {
+                            cell_fmt.rpr.push(rr.clone());
+                        }
+                    }
+                }
+                if let Some(b) = tcpr.and_then(|x| x.child("tcBorders")) {
+                    ce.merge(&styles::parse_edges(b));
+                }
+                let mut cell_margins = None;
+                if let Some(m) = tcpr.and_then(|x| x.child("tcMar")) {
+                    let mut mm = margins;
+                    styles::parse_margins(m, &mut mm);
+                    cell_margins = Some(mm);
+                }
+                let valign = match tcpr.and_then(|x| x.child_val("vAlign")) {
+                    Some("center") => VAlign::Center,
+                    Some("bottom") => VAlign::Bottom,
+                    _ => VAlign::Top,
+                };
                 let shade = tcpr.and_then(|x| x.child("shd")).and_then(styles::shd_fill);
                 t.cells.insert(
                     (ri, col),
-                    CellProps { span, vmerge, shade, tcpr_raw: tcpr.map(|x| x.to_xml()) },
+                    CellProps {
+                        span,
+                        vmerge,
+                        shade,
+                        tcpr_raw: tcpr.map(|x| x.to_xml()),
+                        edges: [ce.top, ce.right, ce.bottom, ce.left],
+                        style_shade,
+                        margins: cell_margins,
+                        valign,
+                    },
                 );
                 let cref = CellRef { table: id, row: ri, col };
                 let before = out.len();
-                self.block_children(tc, out, Some(cref), tbl_style.as_deref());
+                self.block_children(tc, out, Some(cref), Some(&cell_fmt));
                 if out.len() == before {
                     let mut p = Para::new(Style::Normal);
                     p.cell = Some(cref);
@@ -516,7 +635,7 @@ impl Reader<'_> {
         self.tables.insert(id, t);
     }
 
-    fn block_children(&mut self, el: &El, out: &mut Vec<Para>, cell: Option<CellRef>, tbl_style: Option<&str>) {
+    fn block_children(&mut self, el: &El, out: &mut Vec<Para>, cell: Option<CellRef>, tbl_style: Option<&CellFmt>) {
         for c in el.elems() {
             match c.name.as_str() {
                 "p" => {
@@ -641,6 +760,7 @@ fn set_para_props(p: &mut Para, pp: &PProps, numbering: &Numbering) {
     p.tabs = pp.tabs.clone();
     p.shading = pp.shading;
     p.page_break_before = pp.page_break_before;
+    p.borders = pp.borders;
     p.num_id = 0;
     p.list = ListKind::None;
     p.level = 0;
@@ -743,6 +863,65 @@ fn hf_document(
     d.numbering = numbering.clone();
     d.styles = sheet.clone();
     Some(d)
+}
+
+/// Footnote and endnote texts (`footnotes.xml`, `endnotes.xml`) by (is endnote, id).
+pub fn notes_from_parts(
+    parts: &BTreeMap<String, Vec<u8>>,
+    pkg_id: u64,
+    sheet: &Arc<StyleSheet>,
+    numbering: &Numbering,
+) -> BTreeMap<(bool, String), Document> {
+    let mut out = BTreeMap::new();
+    let main = read_rels(parts, "")
+        .values()
+        .find(|r| r.kind == "officeDocument")
+        .map(|r| r.target.clone())
+        .unwrap_or_else(|| "word/document.xml".into());
+    let rels = read_rels(parts, &main);
+    let mut base = 50_000_000;
+    for (kind, tag, endnote) in [("footnotes", "footnote", false), ("endnotes", "endnote", true)] {
+        let Some(target) = rels.values().find(|r| r.kind == kind).map(|r| r.target.clone()) else { continue };
+        let Some(root) = part_xml(parts, &target) else { continue };
+        for note in root.elems().filter(|e| e.name == tag) {
+            // Separators are not notes.
+            if note.attr("type").is_some_and(|t| t != "normal") {
+                continue;
+            }
+            let Some(id) = note.attr("id") else { continue };
+            let mut reader = Reader {
+                parts,
+                rels: read_rels(parts, &target),
+                sheet,
+                numbering,
+                pkg: pkg_id,
+                images: BTreeMap::new(),
+                tables: BTreeMap::new(),
+                pending: Vec::new(),
+                image_base: base,
+            };
+            let mut paras = Vec::new();
+            reader.block_children(note, &mut paras, None, None);
+            if paras.is_empty() {
+                continue;
+            }
+            let tables: BTreeMap<u32, Table> = std::mem::take(&mut reader.tables).into_iter().map(|(k, v)| (k + base, v)).collect();
+            for p in &mut paras {
+                if let Some(c) = &mut p.cell {
+                    c.table += base;
+                }
+            }
+            let mut d = Document::new();
+            d.paras = paras;
+            d.images = std::mem::take(&mut reader.images);
+            d.tables = tables;
+            d.numbering = numbering.clone();
+            d.styles = sheet.clone();
+            out.insert((endnote, id.to_string()), d);
+            base += 10_000;
+        }
+    }
+    out
 }
 
 /// Rich headers and footers referenced by a body `w:sectPr`.
@@ -918,7 +1097,8 @@ pub fn load_docx_bytes(bytes: &[u8]) -> Result<Document, String> {
     doc.tables = tables;
     doc.numbering = numbering;
     doc.styles = Arc::new(sheet);
-    doc.hf = hf_from_parts(&pkg.parts, pkg.body_sect.as_deref(), pkg_id, &doc.styles, &doc.numbering);
+    doc.hf = Arc::new(hf_from_parts(&pkg.parts, pkg.body_sect.as_deref(), pkg_id, &doc.styles, &doc.numbering));
+    doc.notes = Arc::new(notes_from_parts(&pkg.parts, pkg_id, &doc.styles, &doc.numbering));
     doc.pkg = Some(Arc::new(pkg));
     if !paras.is_empty() {
         doc.paras = paras;

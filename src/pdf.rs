@@ -35,9 +35,9 @@ impl Resources {
             .fonts
             .entry(key)
             .or_insert_with(|| {
-                let path = crate::fonts::font_file(&r.family)?;
-                let bytes = std::fs::read(path).ok()?;
-                Font::new(Data::from(bytes), 0)
+                let face = crate::fonts::font_file(&r.family)?;
+                let bytes = std::fs::read(&face.path).ok()?;
+                Font::new(Data::from(bytes), face.index)
             })
             .clone()?;
         Some((font, r.fake_bold, r.fake_italic))

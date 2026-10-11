@@ -3,7 +3,7 @@
 //! Coordinates are page-relative layout units (screen points on screen,
 //! PDF points when laid out with `pdf::PDF_ZOOM`).
 
-use crate::doc::{CharFmt, Document, Leader, Rgba, Style};
+use crate::doc::{Border, BorderKind, CharFmt, Document, Leader, Rgba, Style};
 use crate::layout::{self, Layout, Line};
 use crate::pool::{self, ObjKind};
 
@@ -160,19 +160,87 @@ fn draw_content<C: Canvas>(
             }
         }
         under(c, li);
+        para_borders(c, doc, lay, l);
         draw_line(c, doc, lay, l, page_no);
     }
     // Cell borders on top of everything else.
-    for cell in lay.cells.iter().filter(|b| b.page == page && b.borders) {
-        let k: Rgba = [0, 0, 0, 255];
-        let w = (0.5 * sc).max(0.75);
-        if !cell.merged_above {
-            c.line(cell.x, cell.y, cell.x + cell.w, cell.y, w, k);
-        }
-        c.line(cell.x, cell.y + cell.h, cell.x + cell.w, cell.y + cell.h, w, k);
-        c.line(cell.x, cell.y, cell.x, cell.y + cell.h, w, k);
-        c.line(cell.x + cell.w, cell.y, cell.x + cell.w, cell.y + cell.h, w, k);
+    for cell in lay.cells.iter().filter(|b| b.page == page) {
+        let (x0, y0, x1, y1) = (cell.x, cell.y, cell.x + cell.w, cell.y + cell.h);
+        let [t, r, b, l] = cell.edges;
+        border(c, x0, y0, x1, y0, &t, sc);
+        border(c, x1, y0, x1, y1, &r, sc);
+        border(c, x0, y1, x1, y1, &b, sc);
+        border(c, x0, y0, x0, y1, &l, sc);
     }
+}
+
+/// Draws one border line (axis-aligned) in its style.
+pub fn border<C: Canvas>(c: &mut C, x0: f32, y0: f32, x1: f32, y1: f32, b: &Option<Border>, sc: f32) {
+    let Some(b) = b else { return };
+    if !Border::visible(&Some(*b)) {
+        return;
+    }
+    let w = (b.width * sc).max(0.75);
+    let horizontal = (y0 - y1).abs() < 0.01;
+    match b.kind {
+        BorderKind::None => {}
+        BorderKind::Single => c.line(x0, y0, x1, y1, w, b.color),
+        BorderKind::Double => {
+            let off = w.max(1.0);
+            let lw = (w / 2.0).max(0.6);
+            if horizontal {
+                c.line(x0, y0 - off, x1, y1 - off, lw, b.color);
+                c.line(x0, y0 + off, x1, y1 + off, lw, b.color);
+            } else {
+                c.line(x0 - off, y0, x1 - off, y1, lw, b.color);
+                c.line(x0 + off, y0, x1 + off, y1, lw, b.color);
+            }
+        }
+        BorderKind::Dotted | BorderKind::Dashed => {
+            let (dash, gap) = if b.kind == BorderKind::Dotted { (w, w * 2.0) } else { (w * 4.0, w * 3.0) };
+            let len = if horizontal { (x1 - x0).abs() } else { (y1 - y0).abs() };
+            let mut t = 0.0;
+            while t < len {
+                let e = (t + dash).min(len);
+                if horizontal {
+                    c.line(x0 + t, y0, x0 + e, y1, w, b.color);
+                } else {
+                    c.line(x0, y0 + t, x1, y0 + e, w, b.color);
+                }
+                t += dash + gap;
+            }
+        }
+    }
+}
+
+/// Paragraph borders (`w:pBdr`); consecutive paragraphs with equal borders form one box.
+fn para_borders<C: Canvas>(c: &mut C, doc: &Document, lay: &Layout, l: &Line) {
+    let para = &doc.paras[l.para];
+    let e = &para.borders;
+    if !e.any_visible() {
+        return;
+    }
+    let sc = lay.scale;
+    let pb = &lay.paras[l.para];
+    let same = |i: Option<usize>| i.and_then(|i| doc.paras.get(i)).is_some_and(|p| p.borders == *e && p.cell == para.cell);
+    let first = l.start == 0;
+    let space = |b: &Option<Border>| b.map(|b| b.space * sc).unwrap_or(0.0);
+    let left = pb.left - space(&e.left) - 1.0;
+    let right = pb.right + space(&e.right) + 1.0;
+    let top = l.y - if first { space(&e.top) } else { 0.0 };
+    let bottom = l.y + l.height + if l.last_in_para { space(&e.bottom) } else { 0.0 };
+    if first {
+        if same(l.para.checked_sub(1)) {
+            border(c, left, top, right, top, &e.inside_h, sc);
+        } else {
+            border(c, left, top, right, top, &e.top, sc);
+        }
+    }
+    if l.last_in_para && !same(Some(l.para + 1)) {
+        border(c, left, bottom, right, bottom, &e.bottom, sc);
+    }
+    border(c, left, top, left, bottom, &e.left, sc);
+    border(c, right, top, right, bottom, &e.right, sc);
 }
 
 fn draw_line<C: Canvas>(c: &mut C, doc: &Document, lay: &Layout, l: &Line, page_no: (usize, usize)) {

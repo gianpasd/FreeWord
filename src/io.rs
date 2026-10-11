@@ -356,7 +356,8 @@ pub fn load_native(path: &Path) -> Result<Document, String> {
         None => doc.numbering = Numbering::new_default(),
     }
     if let Some(pkg) = doc.pkg.clone() {
-        doc.hf = crate::docx::hf_from_parts(&pkg.parts, pkg.body_sect.as_deref(), pkg.id, &doc.styles, &doc.numbering);
+        doc.hf = Arc::new(crate::docx::hf_from_parts(&pkg.parts, pkg.body_sect.as_deref(), pkg.id, &doc.styles, &doc.numbering));
+        doc.notes = Arc::new(crate::docx::notes_from_parts(&pkg.parts, pkg.id, &doc.styles, &doc.numbering));
     }
     for im in fd.images {
         if let Ok(bytes) = b64.decode(im.data.as_bytes()) {

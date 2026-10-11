@@ -316,6 +316,10 @@ impl eframe::App for App {
         }
 
         self.text_focus_frame = false;
+        // Fonts requested last frame are now registered with egui: re-layout with them.
+        if crate::fonts::commit() {
+            self.rev += 1;
+        }
         self.handle_events(&ctx);
 
         egui::Panel::top("ribbon").frame(Frame::NONE.fill(ui.visuals().panel_fill)).show(ui, |ui| self.ribbon(ui));
@@ -507,9 +511,15 @@ impl App {
                     let name = fonts::font_name(f.font);
                     egui::ComboBox::from_id_salt("font_family").selected_text(&name).width(150.0).height(400.0).show_ui(ui, |ui| {
                         for n in fonts::available() {
-                            let fam = fonts::resolve(fonts::font_id(&n), false, false).family;
-                            let text = RichText::new(&n).font(FontId::new(15.0, fam));
+                            // Preview names in their own font once it is loaded.
+                            let text = if fonts::is_loaded(&n) {
+                                let fam = fonts::resolve(fonts::font_id(&n), false, false).family;
+                                RichText::new(&n).font(FontId::new(15.0, fam))
+                            } else {
+                                RichText::new(&n).size(14.0)
+                            };
                             if ui.selectable_label(n.eq_ignore_ascii_case(&name), text).clicked() {
+                                fonts::request(ui.ctx(), [n.clone()]);
                                 let id = fonts::font_id(&n);
                                 self.apply_fmt(|c| c.font = id);
                             }
