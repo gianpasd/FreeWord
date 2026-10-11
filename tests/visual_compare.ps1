@@ -12,6 +12,7 @@ if (-not $Pdftoppm) {
 }
 if (-not $Pdftoppm) { throw "pdftoppm not found (install Poppler)" }
 Add-Type -AssemblyName System.Drawing
+New-Item -ItemType Directory -Force $OutDir | Out-Null
 $OutDir = (Resolve-Path $OutDir).Path
 
 function Diff-Images($a, $b) {

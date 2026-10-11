@@ -593,4 +593,22 @@ mod tests {
         }
         assert!(edited >= 1, "no corpus document has a nested table");
     }
+
+    #[test]
+    fn dangling_comment_markers_dropped_on_save() {
+        let mut a = app();
+        a.insert_typed("text");
+        let pkg = a.doc.pkg_id();
+        let para = &mut a.doc.paras[0];
+        for xml in ["<w:commentRangeStart w:id=\"7\"/>", "<w:r><w:commentReference w:id=\"7\"/></w:r>"] {
+            let id = pool::add_obj(RawObj { xml: xml.into(), kind: ObjKind::Hidden, pkg });
+            para.chars.push(OBJ);
+            para.fmts.push(CharFmt { obj: id, ..CharFmt::body() });
+        }
+        let bytes = crate::docx::docx_bytes(&a.doc).expect("save");
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let mut xml = String::new();
+        std::io::Read::read_to_string(&mut zip.by_name("word/document.xml").unwrap(), &mut xml).unwrap();
+        assert!(xml.contains("text") && !xml.contains("comment"), "{xml}");
+    }
 }

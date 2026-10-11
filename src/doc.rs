@@ -489,7 +489,7 @@ mod cell_map {
     enum Repr {
         List(Vec<(u32, u32, CellProps)>),
         // Older files could only hold an empty map.
-        Map(BTreeMap<String, CellProps>),
+        Map(#[allow(dead_code)] BTreeMap<String, CellProps>),
     }
 
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<BTreeMap<(u32, u32), CellProps>, D::Error> {

@@ -4,6 +4,14 @@ Updated at the end of every work session. Newest session notes at the bottom.
 
 ## Next up
 
+- [ ] FreeWord's own pagination vs Word on `tests/corpus_ext` (sample-files.com, not in
+  git): only image-document matches. multi-column 15 vs 46 pages, basic-text 2 vs 1,
+  formatted-report 4 vs 3, large-document 51 vs 49; table-document, template and lists
+  have the right count but break pages elsewhere (`tests/pagination.ps1 -Files ...`)
+- [ ] Word compat rule: a Normal-style font size of 11/12 pt or left justification is
+  overridden by the table style unless `overrideTableStyleFontSizeAndJustification`
+  (LibreOffice `ApplyParagraphPropertiesFromTableStyle`); we apply table rPr only to
+  default-style paragraphs
 - [ ] Text-box contents rendered (wps:txbx) instead of a placeholder box
 - [ ] Repeat table header rows (`w:tblHeader`) on each new page; split long rows across pages (`cantSplit`)
 - [ ] Per-change Accept / Reject (next/previous change navigation)
@@ -70,6 +78,10 @@ Updated at the end of every work session. Newest session notes at the bottom.
   PAGE/NUMPAGES fields); new headers for documents without one
 - [x] Edit nested tables in place (click into one; Esc or click outside to leave);
   rewritten on save with their own relationships/media; kept in `.fwd` files
+- [x] Table-style paragraph properties rank below the paragraph style (as in Word and
+  LibreOffice); cell paragraphs no longer get the table style's spacing written as
+  direct formatting (large-document lost 5 pages in Word after a round-trip)
+- [x] Comment markers without a comment are dropped on save (Word rejects them)
 - [x] `.fwd` save failed for any table with cell properties (tuple map keys in JSON)
 - [x] Edit footnotes/endnotes in place (click a note); Insert Footnote/Endnote
   (Ctrl+Alt+F / Ctrl+Alt+D); notes parts rewritten or created on save
@@ -111,3 +123,9 @@ Updated at the end of every work session. Newest session notes at the bottom.
   tables with cell properties. Tests: `cargo test` 8/8; round-trip 10/10 OK;
   visual compare 10/10 identical; all `tests/out/hf` outputs (incl. nested edit)
   open in Word; short stress run (3 × 200).
+- **2026-10-11** – Added `tests/corpus_ext` (9 sample-files.com documents, git-ignored;
+  test scripts take `-Corpus`). Fixed table-style vs paragraph-style precedence and
+  dropped dangling comment markers; `roundtrip.ps1` reports a damaged original as SKIP.
+  Tests: `cargo test` 9/9; round-trip corpus 10/10 and corpus_ext 8/8 OK (+1 SKIP:
+  tracked-changes original is rejected by Word, our output opens); visual compare
+  identical on both. FreeWord pagination matches Word on 1 of 8 corpus_ext files.

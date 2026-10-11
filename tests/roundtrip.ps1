@@ -52,12 +52,19 @@ try {
             continue
         }
         try {
-            $a = Get-Stats $word $f.FullName
             $b = Get-Stats $word $out
         }
         catch {
             Write-Output "FAIL $($f.Name): Word could not open the result: $($_.Exception.Message)"
             $failures++
+            continue
+        }
+        try {
+            $a = Get-Stats $word $f.FullName
+        }
+        catch {
+            # A damaged source file: only check that FreeWord's output opens.
+            Write-Output "SKIP $($f.Name): Word rejects the original ($($_.Exception.Message)); the result opens"
             continue
         }
         $diffs = @()

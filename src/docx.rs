@@ -190,13 +190,11 @@ impl Reader<'_> {
             .map(|s| s.to_string())
             .or_else(|| self.sheet.default_para.clone());
         let is_default_style = style_id == self.sheet.default_para;
-        let mut pp = self.sheet.para_props(style_id.as_deref(), self.numbering);
+        let table_ppr = tbl_style.map(|cf| cf.ppr.as_slice()).unwrap_or(&[]);
+        let mut pp = self.sheet.para_props_in_table(style_id.as_deref(), table_ppr, self.numbering);
         let mut base = self.sheet.char_fmt(style_id.as_deref(), None);
-        // Table style formatting applies to paragraphs using the default style.
+        // Table style run formatting applies to paragraphs using the default style.
         if let (Some(cf), true) = (tbl_style, is_default_style) {
-            for tp in &cf.ppr {
-                self.sheet.apply_ppr(tp, &mut pp, self.numbering);
-            }
             for tr in &cf.rpr {
                 self.sheet.apply_rpr(tr, &mut base);
             }
@@ -1484,6 +1482,10 @@ struct Writer<'a> {
     inline_only: bool,
     /// File name prefix of new media parts.
     media_tag: String,
+    /// Comments that exist; markers of any other comment are dropped (None = keep all).
+    comment_ids: Option<HashSet<String>>,
+    /// Style `w:pPr` of each table, by table id.
+    table_ppr: HashMap<u32, Vec<El>>,
 }
 
 impl<'a> Writer<'a> {
@@ -1502,6 +1504,8 @@ impl<'a> Writer<'a> {
             used_rel_ids,
             inline_only: false,
             media_tag: "fw_image".into(),
+            comment_ids: None,
+            table_ppr: HashMap::new(),
         };
         w.balance_fields();
         w
@@ -1640,6 +1644,20 @@ impl<'a> Writer<'a> {
         }
     }
 
+    /// A comment range marker or reference whose comment does not exist (Word rejects those).
+    fn dangling_comment(&self, xml: &str) -> bool {
+        let Some(ids) = &self.comment_ids else { return false };
+        let at = if xml.starts_with("<w:commentRange") {
+            0
+        } else {
+            match xml.find("<w:commentReference") {
+                Some(i) if !xml.contains("<w:t") => i,
+                _ => return false,
+            }
+        };
+        xml_attr(&xml[at..], "w:id").is_some_and(|id| !ids.contains(id))
+    }
+
     fn base_for(&mut self, p: &Para, extra: u32) -> CharFmt {
         let rstyle = if extra != 0 {
             self.cache.extras(extra).iter().find(|e| e.name == "rStyle").and_then(|e| e.attr("val").map(|s| s.to_string()))
@@ -1676,7 +1694,8 @@ impl<'a> Writer<'a> {
             return;
         }
         let style = self.style_for_write(p);
-        let base = doc.styles.para_props(style.as_deref(), &doc.numbering);
+        let table_ppr = p.cell.map(|c| self.table_ppr(c.table)).unwrap_or_default();
+        let base = doc.styles.para_props_in_table(style.as_deref(), &table_ppr, &doc.numbering);
         let mut items: Vec<(String, String)> = Vec::new();
         if let Some(s) = &style {
             if Some(s) != doc.styles.default_para.as_ref() {
@@ -1822,7 +1841,7 @@ impl<'a> Writer<'a> {
             }
             if f.obj != 0 {
                 if let Some(o) = pool::obj(f.obj) {
-                    if self.obj_allowed(&o) && !self.drop_markers.contains(&(pi, i)) {
+                    if self.obj_allowed(&o) && !self.drop_markers.contains(&(pi, i)) && !self.dangling_comment(&o.xml) {
                         // Paragraph-level objects (bookmarks, ins/del...) must not sit inside a hyperlink.
                         let paragraph_level = !o.xml.starts_with("<w:r>") && !o.xml.starts_with("<w:r ");
                         if paragraph_level && open_link != 0 {
@@ -1916,11 +1935,26 @@ impl<'a> Writer<'a> {
         ));
     }
 
+    /// Paragraph properties of a table's style (what its cell paragraphs inherit).
+    fn table_ppr(&mut self, table: u32) -> Vec<El> {
+        let doc = self.doc;
+        self.table_ppr
+            .entry(table)
+            .or_insert_with(|| {
+                let raw = doc.tables.get(&table).and_then(|t| t.tblpr_raw.as_deref());
+                let el = raw.and_then(|r| xml::parse(r).ok());
+                let id = el.as_ref().and_then(|e| e.child_val("tblStyle")).map(|s| s.to_string());
+                doc.styles.table_style(id.as_deref()).ppr
+            })
+            .clone()
+    }
+
     /// A nested table edited in FreeWord, written with this writer's relationships.
     fn nested_xml(&mut self, pi: usize, sub: &Document, out: &mut String) {
         let mut w = Writer::new(sub, self.pkg_id, std::mem::take(&mut self.used_rel_ids));
         w.media_tag = format!("fw_nested{pi}_image");
         w.doc_pr_id = self.doc_pr_id;
+        w.comment_ids = self.comment_ids.clone();
         out.push_str(&w.blocks_xml());
         self.used_rel_ids = w.used_rel_ids;
         self.doc_pr_id = w.doc_pr_id;
@@ -2425,6 +2459,14 @@ pub fn note_from_xml(doc: &Document, endnote: bool, id: &str, xml: &str) -> Docu
     d
 }
 
+/// Value of attribute `name` in the first tag of `xml`.
+fn xml_attr<'x>(xml: &'x str, name: &str) -> Option<&'x str> {
+    let tag = &xml[..xml.find('>')?];
+    let i = tag.find(&format!(" {name}=\""))? + name.len() + 3;
+    let e = tag[i..].find('"')?;
+    Some(&tag[i..i + e])
+}
+
 /// A nested table read back from its `w:tbl` XML (for `.fwd` files).
 pub fn nested_from_xml(doc: &Document, xml: &str) -> Option<Document> {
     let target = "word/nested_fw.xml".to_string();
@@ -2484,6 +2526,7 @@ pub fn docx_bytes(doc: &Document) -> Result<Vec<u8>, String> {
         }
     }
     let mut w = Writer::new(doc, doc.pkg_id(), used);
+    w.comment_ids = Some(doc.comments.keys().cloned().collect());
     let body = w.blocks_xml();
 
     // Header/footer: keep the originals unless the user edited them. Headers

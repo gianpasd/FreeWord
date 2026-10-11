@@ -497,9 +497,18 @@ impl StyleSheet {
 
     /// Effective paragraph properties from docDefaults + paragraph style chain.
     pub fn para_props(&self, pstyle: Option<&str>, numbering: &Numbering) -> PProps {
+        self.para_props_in_table(pstyle, &[], numbering)
+    }
+
+    /// Paragraph properties inside a table cell: the table style's `w:pPr` (`table_ppr`)
+    /// outranks the document defaults but not the paragraph style, as in Word.
+    pub fn para_props_in_table(&self, pstyle: Option<&str>, table_ppr: &[El], numbering: &Numbering) -> PProps {
         let mut p = PProps::default();
         if let Some(d) = &self.doc_ppr {
             self.apply_ppr(d, &mut p, numbering);
+        }
+        for tp in table_ppr {
+            self.apply_ppr(tp, &mut p, numbering);
         }
         for d in self.chain(self.para_style_or_default(pstyle)) {
             if let Some(pp) = &d.ppr {
