@@ -1,7 +1,7 @@
 //! Ribbon, status bar, dialogs and the eframe entry point.
 
 use crate::app::{After, App, Tab};
-use crate::doc::{Align, ListKind, NO_COLOR, Rgba, Style};
+use crate::doc::{Align, ListKind, NO_COLOR, Pos, Rgba, Style};
 use crate::editor::c32;
 use crate::fonts;
 use eframe::egui::{
@@ -1025,9 +1025,26 @@ impl App {
 
     fn review_tab(&mut self, ui: &mut Ui) {
         group(ui, "Proofing", |ui| {
+            if big_btn(ui, "ABC✓", "Spelling", "Check the spelling of the document (F7)").clicked() {
+                self.start_spelling();
+            }
             if big_btn(ui, "123", "Word Count", "Find the number of words, characters and paragraphs").clicked() {
                 self.dlg.word_count = true;
             }
+        });
+        group(ui, "Language", |ui| {
+            ui.vertical(|ui| {
+                let current = self.spell.active.clone();
+                let label = self.spell.active_label();
+                egui::ComboBox::from_id_salt("spell_lang").selected_text(label).width(160.0).show_ui(ui, |ui| {
+                    for l in self.spell.langs.clone() {
+                        if ui.selectable_label(l.code == current, l.label()).clicked() {
+                            self.spell.set_language(&l.code);
+                        }
+                    }
+                });
+                ui.checkbox(&mut self.spell.enabled, "Check spelling as you type");
+            });
         });
         group(ui, "Find", |ui| {
             if big_btn(ui, "🔍", "Find", "Find text (Ctrl+F)").clicked() {
@@ -1100,6 +1117,11 @@ impl App {
                     ui.add_space(12.0);
                     ui.label(msg);
                 }
+            }
+            ui.add_space(12.0);
+            let lang = self.spell.active_label();
+            if ui.add(egui::Label::new(RichText::new(format!("📖 {lang}")).color(Color32::WHITE)).sense(Sense::click())).on_hover_text("Check spelling (F7)").clicked() {
+                self.start_spelling();
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(format!("{:.0}%", self.zoom * 100.0));
@@ -1390,6 +1412,10 @@ impl App {
             self.dlg.paragraph = open;
         }
 
+        if self.dlg.spelling {
+            self.spelling_dialog(ctx);
+        }
+
         if self.dlg.link {
             let mut open = true;
             let mut apply = false;
@@ -1477,6 +1503,128 @@ impl App {
             });
             self.dlg.shortcuts = open;
         }
+    }
+
+    fn spelling_dialog(&mut self, ctx: &egui::Context) {
+        let mut open = true;
+        let mut action: Option<&str> = None;
+        let item = self.dlg.spell_item.clone();
+        egui::Window::new(format!("Spelling: {}", self.spell.active_label()))
+            .id(egui::Id::new("spelling_window"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(360.0)
+            .default_pos(Pos2::new(ctx.content_rect().right() - 400.0, 160.0))
+            .show(ctx, |ui| {
+                if !self.spell.is_ready() {
+                    ui.label("Loading dictionary…");
+                    ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                    return;
+                }
+                let Some((a, b, sugg)) = &item else {
+                    ui.label(if self.dlg.spell_done { "The spelling check is complete." } else { "No spelling errors found." });
+                    if ui.button("Close").clicked() {
+                        action = Some("close");
+                    }
+                    return;
+                };
+                let word = self.doc.plain_text(*a, *b);
+                // Show the word in its sentence.
+                let para = &self.doc.paras[a.p];
+                let s = a.o.saturating_sub(40);
+                let e = (b.o + 40).min(para.len());
+                let before: String = para.chars[s..a.o].iter().filter(|c| **c != crate::doc::OBJ).collect();
+                let after: String = para.chars[b.o..e].iter().filter(|c| **c != crate::doc::OBJ).collect();
+                ui.label("Not in Dictionary:");
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.set_width(330.0);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        ui.label(format!("{}{before}", if s > 0 { "…" } else { "" }));
+                        ui.label(RichText::new(&word).color(Color32::from_rgb(0xD0, 0x20, 0x20)).strong());
+                        ui.label(format!("{after}{}", if e < para.len() { "…" } else { "" }));
+                    });
+                });
+                ui.add_space(4.0);
+                ui.label("Suggestions:");
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.set_width(330.0);
+                    ui.set_min_height(110.0);
+                    if sugg.is_empty() {
+                        ui.label(RichText::new("(no suggestions)").italics().weak());
+                    }
+                    for (i, s) in sugg.iter().enumerate() {
+                        let r = ui.selectable_label(self.dlg.spell_choice == i, s);
+                        if r.clicked() {
+                            self.dlg.spell_choice = i;
+                        }
+                        if r.double_clicked() {
+                            self.dlg.spell_choice = i;
+                            action = Some("change");
+                        }
+                    }
+                });
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Ignore Once").clicked() {
+                        action = Some("ignore");
+                    }
+                    if ui.button("Ignore All").clicked() {
+                        action = Some("ignore_all");
+                    }
+                    if ui.button("Add to Dictionary").clicked() {
+                        action = Some("add");
+                    }
+                });
+                ui.horizontal(|ui| {
+                    let can = !sugg.is_empty();
+                    if ui.add_enabled(can, egui::Button::new("Change")).clicked() {
+                        action = Some("change");
+                    }
+                    if ui.add_enabled(can, egui::Button::new("Change All")).clicked() {
+                        action = Some("change_all");
+                    }
+                });
+            });
+        if let (Some(act), Some((a, b, sugg))) = (action, item.clone()) {
+            let word = self.doc.plain_text(a, b);
+            let choice = sugg.get(self.dlg.spell_choice).cloned();
+            match act {
+                "ignore" => self.spell_advance(b),
+                "ignore_all" => {
+                    self.spell.ignore_all(&word);
+                    self.spell_advance(a);
+                }
+                "add" => {
+                    self.spell.add_to_dictionary(&word);
+                    self.spell_advance(a);
+                }
+                "change" => {
+                    if let Some(c) = choice {
+                        self.replace_word(a, b, &c);
+                        let next = Pos::new(a.p, a.o + c.chars().count());
+                        self.spell_advance(next);
+                    }
+                }
+                "change_all" => {
+                    if let Some(c) = choice {
+                        self.replace_all_words(&word, &c);
+                        self.spell_advance(a);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if action == Some("close") {
+            open = false;
+        }
+        if self.dlg.spell_item.is_none() && !self.dlg.spell_done && self.spell.is_ready() && open {
+            // The dictionary finished loading after the dialog opened.
+            let from = self.sel().0;
+            self.spell_advance(from);
+        }
+        self.dlg.spelling = open;
     }
 
     fn find_dialog(&mut self, ctx: &egui::Context) {

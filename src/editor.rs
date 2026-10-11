@@ -123,6 +123,7 @@ impl App {
                     self.insert_typed("\t");
                 }
             }
+            Key::F7 => self.start_spelling(),
             Key::Escape => {
                 self.format_painter = None;
                 self.find.open = false;
@@ -401,6 +402,15 @@ impl App {
                 if !(self.has_sel() && pos >= a && pos <= b) {
                     self.set_cursor(pos, false);
                 }
+                // Remember a misspelled word under the pointer for the context menu.
+                self.ctx_word = None;
+                let ranges = self.spell.misspelled(&self.doc.paras[pos.p]);
+                if let Some((s, e)) = ranges.into_iter().find(|(s, e)| pos.o >= *s && pos.o <= *e) {
+                    let (ws, we) = (Pos::new(pos.p, s), Pos::new(pos.p, e));
+                    let word = self.doc.plain_text(ws, we);
+                    let sugg = self.spell.suggest(&word);
+                    self.ctx_word = Some((ws, we, sugg));
+                }
             }
         }
 
@@ -446,6 +456,30 @@ impl App {
 
         resp.context_menu(|ui| {
             ui.set_min_width(180.0);
+            if let Some((ws, we, sugg)) = self.ctx_word.clone() {
+                if sugg.is_empty() {
+                    ui.label(egui::RichText::new("(no spelling suggestions)").italics().weak());
+                }
+                for s in &sugg {
+                    if ui.button(egui::RichText::new(s).strong()).clicked() {
+                        self.replace_word(ws, we, s);
+                        self.ctx_word = None;
+                        ui.close();
+                    }
+                }
+                let word = self.doc.plain_text(ws, we);
+                if ui.button("Ignore All").clicked() {
+                    self.spell.ignore_all(&word);
+                    self.ctx_word = None;
+                    ui.close();
+                }
+                if ui.button("Add to Dictionary").clicked() {
+                    self.spell.add_to_dictionary(&word);
+                    self.ctx_word = None;
+                    ui.close();
+                }
+                ui.separator();
+            }
             if ui.add_enabled(self.has_sel(), egui::Button::new("✂  Cut").shortcut_text("Ctrl+X")).clicked() {
                 self.cut();
                 ui.close();
@@ -598,6 +632,27 @@ impl App {
                 let para = &self.doc.paras[l.para];
                 let base = o.y + l.y + l.baseline;
                 let x_of = |k: usize| o.x + l.xs[k - l.start];
+                // Spelling: red wavy underline.
+                for (s, e) in self.spell.misspelled(para) {
+                    let (s, e) = (s.max(l.start), e.min(l.end));
+                    if s >= e {
+                        continue;
+                    }
+                    let (x0, x1) = (x_of(s), x_of(e));
+                    let y = base + 2.0 * sc.max(0.8);
+                    let amp = 1.4;
+                    let step = 2.5;
+                    let mut pts = Vec::new();
+                    let mut x = x0;
+                    let mut up = true;
+                    while x < x1 {
+                        pts.push(pos2(x, if up { y - amp } else { y + amp }));
+                        x += step;
+                        up = !up;
+                    }
+                    pts.push(pos2(x1, y));
+                    painter.add(egui::Shape::line(pts, Stroke::new(1.0, Color32::from_rgb(0xE0, 0x20, 0x20))));
+                }
                 // Selected picture: frame and resize handle.
                 for k in l.start..l.end {
                     let f = para.fmts[k];

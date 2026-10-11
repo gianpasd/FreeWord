@@ -66,6 +66,11 @@ pub struct Dialogs {
     pub link: bool,
     pub link_url: String,
     pub link_text: String,
+    pub spelling: bool,
+    /// Word being reviewed in the Spelling dialog, with suggestions.
+    pub spell_item: Option<(Pos, Pos, Vec<String>)>,
+    pub spell_choice: usize,
+    pub spell_done: bool,
     pub error: Option<String>,
 }
 
@@ -125,6 +130,9 @@ pub struct App {
     /// Set when a dialog text field had keyboard focus during this frame.
     pub text_focus_frame: bool,
     pub viewport_h: f32,
+    pub spell: crate::spell::Speller,
+    /// Misspelled word under the last right-click: (start, end, suggestions).
+    pub ctx_word: Option<(Pos, Pos, Vec<String>)>,
 }
 
 /// Loads a document by extension.
@@ -202,6 +210,8 @@ impl App {
             last_highlight: [255, 255, 0, 255],
             text_focus_frame: false,
             viewport_h: 600.0,
+            spell: crate::spell::Speller::new(),
+            ctx_word: None,
         };
         crate::ui::apply_theme(&cc.egui_ctx, false);
         if let Some(arg) = std::env::args().nth(1) {
@@ -827,6 +837,92 @@ impl App {
         self.set_cursor(Pos::new(p, 0), false);
     }
 
+    // ------------------------------------------------------------ spelling
+
+    /// Uses the document's default language (w:lang) for spell checking when available.
+    pub fn adopt_document_language(&mut self) {
+        let lang = self
+            .doc
+            .styles
+            .doc_rpr
+            .as_ref()
+            .and_then(|r| r.child("lang"))
+            .and_then(|l| l.attr("val"))
+            .map(|s| s.to_string());
+        if let Some(l) = lang {
+            self.spell.set_language(&l);
+        }
+    }
+
+    /// Next misspelled word at or after `from`, wrapping around once.
+    pub fn next_misspelling(&mut self, from: Pos) -> Option<(Pos, Pos)> {
+        let n = self.doc.paras.len();
+        for k in 0..=n {
+            let pi = (from.p + k) % n;
+            let ranges = self.spell.misspelled(&self.doc.paras[pi]);
+            for (s, e) in ranges {
+                let wrapped = k == n;
+                if (k == 0 && s < from.o) || (wrapped && s >= from.o) {
+                    continue;
+                }
+                if wrapped && pi != from.p {
+                    continue;
+                }
+                return Some((Pos::new(pi, s), Pos::new(pi, e)));
+            }
+        }
+        None
+    }
+
+    /// Opens the Spelling dialog at the next error (F7).
+    pub fn start_spelling(&mut self) {
+        self.dlg.spelling = true;
+        self.dlg.spell_done = false;
+        let from = self.sel().0;
+        self.spell_advance(from);
+    }
+
+    pub fn spell_advance(&mut self, from: Pos) {
+        match self.next_misspelling(from) {
+            Some((a, b)) => {
+                let word = self.doc.plain_text(a, b);
+                let sugg = self.spell.suggest(&word);
+                self.select(a, b);
+                self.dlg.spell_item = Some((a, b, sugg));
+                self.dlg.spell_choice = 0;
+            }
+            None => {
+                self.dlg.spell_item = None;
+                self.dlg.spell_done = true;
+            }
+        }
+    }
+
+    /// Replaces a word range keeping the formatting of its first character.
+    pub fn replace_word(&mut self, a: Pos, b: Pos, with: &str) {
+        let f = self.doc.paras[a.p].fmt_at(a.o + 1);
+        self.checkpoint(EditKind::Other);
+        self.doc.delete(a, b);
+        let end = self.doc.insert_text(a, with, f);
+        self.select(end, end);
+    }
+
+    /// Replaces every occurrence of a misspelled word (Change All).
+    pub fn replace_all_words(&mut self, word: &str, with: &str) {
+        let hits = self.doc.find_all(word, true, true);
+        if hits.is_empty() {
+            return;
+        }
+        self.checkpoint(EditKind::Other);
+        for (a, b) in hits.iter().rev() {
+            let f = self.doc.paras[a.p].fmt_at(a.o + 1);
+            self.doc.delete(*a, *b);
+            self.doc.insert_text(*a, with, f);
+        }
+        let c = self.doc.clamp(self.cursor);
+        self.select(c, c);
+    }
+
     // ------------------------------------------------------------ hyperlinks
 
     pub fn link_at_cursor(&self) -> Option<u32> {
@@ -1421,6 +1517,7 @@ impl App {
                 // Only formats we can write back keep their path for Save.
                 let keep = matches!(ext.as_str(), "docx" | "fwd" | "txt");
                 self.reset_with(doc, keep.then(|| path.to_path_buf()));
+                self.adopt_document_language();
                 self.set_status(format!("Opened {}", path.display()));
             }
             Err(e) => self.error(format!("Could not open {}:\n{e}", path.display())),

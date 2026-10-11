@@ -79,7 +79,13 @@ pub fn font_name(id: u16) -> String {
 }
 
 fn catalog() -> &'static Catalog {
-    CATALOG.get().expect("fonts::install must be called first")
+    // Without `install` (tests, headless tools) fall back to egui's built-in fonts.
+    CATALOG.get_or_init(|| Catalog {
+        families: vec![
+            ("Calibri".into(), [Some(FontFamily::Proportional), None, None, None]),
+            ("Consolas".into(), [Some(FontFamily::Monospace), None, None, None]),
+        ],
+    })
 }
 
 /// Names of all fonts available for rendering, in menu order.

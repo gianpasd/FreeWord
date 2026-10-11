@@ -11,6 +11,7 @@ mod numbering;
 mod pdf;
 mod pool;
 mod render;
+mod spell;
 mod styles;
 mod ui;
 mod xml;
