@@ -12,6 +12,7 @@ mod pdf;
 mod pool;
 mod render;
 mod spell;
+mod stress;
 mod styles;
 mod ui;
 mod xml;
@@ -20,6 +21,15 @@ fn main() -> eframe::Result {
     let args: Vec<String> = std::env::args().collect();
     if args.len() == 4 && args[1] == "--convert" {
         if let Err(e) = app::convert(args[2].as_ref(), args[3].as_ref()) {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+    if args.len() == 6 && args[1] == "--stress" {
+        let seed = args[4].parse().unwrap_or(1);
+        let steps = args[5].parse().unwrap_or(200);
+        if let Err(e) = stress::run(args[2].as_ref(), args[3].as_ref(), seed, steps) {
             eprintln!("error: {e}");
             std::process::exit(1);
         }

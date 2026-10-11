@@ -176,8 +176,18 @@ impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         crate::fonts::install(&cc.egui_ctx);
         cc.egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
-        let mut app = App {
-            ctx: cc.egui_ctx.clone(),
+        let mut app = App::with_ctx(cc.egui_ctx.clone());
+        crate::ui::apply_theme(&cc.egui_ctx, false);
+        if let Some(arg) = std::env::args().nth(1) {
+            app.open_path(Path::new(&arg));
+        }
+        app
+    }
+
+    /// An editor bound to an egui context (also used headless by tests).
+    pub fn with_ctx(ctx: egui::Context) -> Self {
+        App {
+            ctx,
             doc: Document::new(),
             path: None,
             dirty: false,
@@ -218,12 +228,7 @@ impl App {
             viewport_h: 600.0,
             spell: crate::spell::Speller::new(),
             ctx_word: None,
-        };
-        crate::ui::apply_theme(&cc.egui_ctx, false);
-        if let Some(arg) = std::env::args().nth(1) {
-            app.open_path(Path::new(&arg));
         }
-        app
     }
 
     // ------------------------------------------------------------ basics
