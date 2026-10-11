@@ -801,6 +801,9 @@ fn set_para_props(p: &mut Para, pp: &PProps, numbering: &Numbering) {
     p.shading = pp.shading;
     p.page_break_before = pp.page_break_before;
     p.borders = pp.borders;
+    p.keep_next = pp.keep_next;
+    p.keep_lines = pp.keep_lines;
+    p.widow = pp.widow;
     p.num_id = 0;
     p.list = ListKind::None;
     p.level = 0;

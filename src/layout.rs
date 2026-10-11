@@ -690,6 +690,24 @@ impl Pager {
         at
     }
 
+    /// Whether a block of height `h` fits below the current position.
+    fn fits(&self, h: f32) -> bool {
+        self.y + h + self.notes_h <= self.content_h
+    }
+
+    /// Moves to the next column or page (a pagination-rule break).
+    fn advance(&mut self) {
+        if self.y <= self.col_top {
+            return;
+        }
+        if self.col + 1 < self.cols {
+            self.col += 1;
+            self.y = self.col_top;
+        } else {
+            self.force = true;
+        }
+    }
+
     /// Starts a new set of columns below everything on the current page.
     fn set_columns(&mut self, cols: usize) {
         if cols != self.cols || self.col > 0 {
@@ -1128,6 +1146,41 @@ pub fn layout(doc: &Document, fonts: &mut FontsView<'_>, zoom: f32) -> Layout {
         }
         let col_w = ((pw - ml - mr) - gap * sc * (ncols as f32 - 1.0)) / ncols as f32;
         let pl = ctx.para(doc, pi, labels[pi].as_ref(), ml, ml + col_w);
+        // Pagination rules: keep lines together, keep with next, orphan control.
+        let heights: Vec<f32> = pl.lines.iter().map(|l| l.height).collect();
+        let n_lines = heights.len();
+        let total_h: f32 = heights.iter().sum();
+        if !pager.force && pager.y > pager.col_top {
+            let mut need = if para.keep_lines || (para.widow && n_lines <= 3) {
+                total_h
+            } else if para.widow && n_lines >= 2 {
+                heights[0] + heights[1]
+            } else {
+                heights.first().copied().unwrap_or(0.0)
+            };
+            if para.keep_next {
+                // This paragraph plus the start of the next ones in the chain.
+                need = total_h;
+                let mut j = pi + 1;
+                while j < doc.paras.len() && doc.paras[j].cell.is_none() && j < pi + 8 {
+                    let next = &doc.paras[j];
+                    let nl = ctx.para(doc, j, labels[j].as_ref(), ml, ml + col_w);
+                    let nh: Vec<f32> = nl.lines.iter().map(|l| l.height).collect();
+                    need += next.space_before * sc;
+                    if next.keep_next {
+                        need += nh.iter().sum::<f32>() + next.space_after * sc;
+                        j += 1;
+                        continue;
+                    }
+                    need += if next.widow && nh.len() >= 2 { nh[0] + nh[1] } else { nh.first().copied().unwrap_or(0.0) };
+                    break;
+                }
+            }
+            // Only break if the block would fit on an empty page.
+            if !pager.fits(need) && need <= pager.content_h - pager.col_top {
+                pager.advance();
+            }
+        }
         let first_line = lines.len();
         let mut first_shift = None;
         // Floats are positioned relative to where the paragraph starts, before its
@@ -1151,7 +1204,13 @@ pub fn layout(doc: &Document, fonts: &mut FontsView<'_>, zoom: f32) -> Layout {
                 y += l.height;
             }
         }
-        for mut l in pl.lines {
+        for (li_idx, mut l) in pl.lines.into_iter().enumerate() {
+            // Widow control: don't leave the last line alone at the top of a page.
+            if para.widow && n_lines >= 3 && li_idx == n_lines - 2 && !pager.force {
+                if pager.fits(heights[li_idx]) && !pager.fits(heights[li_idx] + heights[li_idx + 1]) {
+                    pager.advance();
+                }
+            }
             // Footnotes referenced on this line must fit on the same page.
             let mut new_notes = Vec::new();
             let mut notes_h = 0.0;

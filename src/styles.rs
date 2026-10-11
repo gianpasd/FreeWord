@@ -53,6 +53,10 @@ pub struct PProps {
     pub shading: Rgba,
     pub page_break_before: bool,
     pub borders: Edges,
+    pub keep_next: bool,
+    pub keep_lines: bool,
+    /// Widow/orphan control (Word's default is on).
+    pub widow: bool,
 }
 
 impl Default for PProps {
@@ -72,6 +76,9 @@ impl Default for PProps {
             shading: NO_COLOR,
             page_break_before: false,
             borders: Edges::default(),
+            keep_next: false,
+            keep_lines: false,
+            widow: true,
         }
     }
 }
@@ -454,6 +461,9 @@ impl StyleSheet {
                 "contextualSpacing" => p.contextual = on(e),
                 "pBdr" => p.borders.merge(&parse_edges(e)),
                 "pageBreakBefore" => p.page_break_before = on(e),
+                "keepNext" => p.keep_next = on(e),
+                "keepLines" => p.keep_lines = on(e),
+                "widowControl" => p.widow = on(e),
                 "shd" => p.shading = shd_fill(e).unwrap_or(NO_COLOR),
                 "tabs" => {
                     for t in e.elems().filter(|t| t.name == "tab") {

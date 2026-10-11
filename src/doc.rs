@@ -540,6 +540,10 @@ pub struct Para {
     pub shading: Rgba,
     /// Paragraph borders for display (the XML lives in the style or `ppr_extra`).
     pub borders: Edges,
+    /// Pagination controls (display only; the XML lives in the style or `ppr_extra`).
+    pub keep_next: bool,
+    pub keep_lines: bool,
+    pub widow: bool,
     pub page_break_before: bool,
     /// A section ends with this paragraph (raw `w:sectPr` lives in `ppr_extra`).
     pub sect_break: bool,
@@ -576,6 +580,9 @@ impl Para {
             tabs: Vec::new(),
             shading: NO_COLOR,
             borders: Edges::default(),
+            keep_next: style.next_is_normal(),
+            keep_lines: false,
+            widow: true,
             page_break_before: false,
             sect_break: false,
             ppr_extra: String::new(),
@@ -1257,6 +1264,9 @@ impl Document {
             p.tabs = pp.tabs;
             p.shading = pp.shading;
             p.borders = pp.borders;
+            p.keep_next = pp.keep_next;
+            p.keep_lines = pp.keep_lines;
+            p.widow = pp.widow;
             match pp.num {
                 Some((n, l)) => {
                     p.num_id = n;
