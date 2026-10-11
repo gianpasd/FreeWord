@@ -12,6 +12,7 @@ mod pdf;
 mod pool;
 mod render;
 mod spell;
+mod story;
 mod stress;
 mod styles;
 mod ui;

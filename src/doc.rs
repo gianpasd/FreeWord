@@ -783,6 +783,10 @@ pub struct Document {
     pub numbering: Numbering,
     pub styles: Arc<StyleSheet>,
     pub pkg: Option<Arc<Package>>,
+    /// Package part a header/footer sub-document was read from (None if created in FreeWord).
+    pub source: Option<String>,
+    /// A header/footer sub-document changed since it was read (its part is rewritten on save).
+    pub edited: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -818,6 +822,8 @@ impl Document {
             numbering: Numbering::new_default(),
             styles: Arc::new(StyleSheet::generated()),
             pkg: None,
+            source: None,
+            edited: false,
         }
     }
 
@@ -830,6 +836,47 @@ impl Document {
             .map(|b| b.as_ref())
             .chain(self.notes.values())
             .chain(self.paras.iter().filter_map(|p| p.nested.as_deref()))
+    }
+
+    /// The header/footer slot of a section (variants as in `layout::hf_doc`).
+    pub fn hf_slot_mut(&mut self, section: usize, variant: usize) -> Option<&mut Option<Box<Document>>> {
+        let h = Arc::make_mut(&mut self.hf).get_mut(section)?;
+        Some(match variant {
+            0 => &mut h.header,
+            1 => &mut h.header_first,
+            2 => &mut h.footer,
+            _ => &mut h.footer_first,
+        })
+    }
+
+    /// Stores an edited header/footer in its slot and in every other slot showing the same part.
+    pub fn put_hf(&mut self, section: usize, variant: usize, sub: Document) {
+        let source = sub.source.clone();
+        if let (Some(src), true) = (&source, self.hf.len() > 0) {
+            for h in Arc::make_mut(&mut self.hf).iter_mut() {
+                for slot in [&mut h.header, &mut h.header_first, &mut h.footer, &mut h.footer_first] {
+                    if slot.as_ref().is_some_and(|d| d.source.as_ref() == Some(src)) {
+                        *slot = Some(Box::new(sub.clone()));
+                    }
+                }
+            }
+        }
+        if let Some(slot) = self.hf_slot_mut(section, variant) {
+            *slot = Some(Box::new(sub));
+        }
+    }
+
+    /// Removes every rich header (or footer), so the plain-text one is shown and saved.
+    pub fn clear_rich_hf(&mut self, header: bool) {
+        for h in Arc::make_mut(&mut self.hf).iter_mut() {
+            if header {
+                h.header = None;
+                h.header_first = None;
+            } else {
+                h.footer = None;
+                h.footer_first = None;
+            }
+        }
     }
 
     /// Raw `w:sectPr` of every section in order (paragraph-level ones, then the body's).

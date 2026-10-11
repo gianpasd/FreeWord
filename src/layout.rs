@@ -25,6 +25,7 @@ pub fn show_markup() -> bool {
 const SCRIPT_SCALE: f32 = 0.65;
 const SMALL_CAPS_SCALE: f32 = 0.8;
 
+#[derive(Clone)]
 pub struct Line {
     pub para: usize,
     pub start: usize,
@@ -43,6 +44,7 @@ pub struct Line {
     pub leaders: Vec<(usize, Leader)>,
 }
 
+#[derive(Clone)]
 pub struct ParaBox {
     pub lines: Range<usize>,
     /// Horizontal extent of the paragraph's text area.
@@ -52,6 +54,7 @@ pub struct ParaBox {
 }
 
 /// A table cell's rectangle on a page.
+#[derive(Clone)]
 pub struct CellBox {
     pub page: usize,
     pub x: f32,
@@ -63,6 +66,7 @@ pub struct CellBox {
     pub edges: [Option<doc::Border>; 4],
 }
 
+#[derive(Clone)]
 pub struct Layout {
     pub lines: Vec<Line>,
     pub paras: Vec<ParaBox>,
@@ -163,6 +167,7 @@ fn find_comments(doc: &Document) -> Vec<(String, Pos, Pos)> {
 type BTreeMapPages = std::collections::BTreeMap<usize, Vec<((bool, String), Box<Layout>, f32)>>;
 
 /// A laid-out header or footer. Variants: 0 header, 1 first-page header, 2 footer, 3 first-page footer.
+#[derive(Clone)]
 pub struct HfBox {
     pub section: usize,
     pub variant: usize,
@@ -195,6 +200,48 @@ impl Layout {
         let d = hf_doc(doc, section, variant)?;
         let b = self.hf.iter().find(|b| b.section == section && b.variant == variant)?;
         Some((b, d))
+    }
+
+    /// Section and variant of the header (or footer) shown on `page`, whether or not it has content.
+    pub fn hf_slot(&self, doc: &Document, header: bool, page: usize) -> (usize, usize) {
+        let section = self.page_section.get(page).copied().unwrap_or(0);
+        let first = self.section_first_page.get(section) == Some(&page) && doc.hf.get(section).is_some_and(|h| h.title_page);
+        (section, if header { 0 } else { 2 } + first as usize)
+    }
+
+    /// Layout of a header/footer placed on `page` of this (body) layout, for editing it in place:
+    /// its lines are moved onto `page` and every other page is empty.
+    pub fn story_layout(&self, section: usize, variant: usize, page: usize) -> Option<Layout> {
+        let b = self.hf.iter().find(|b| b.section == section && b.variant == variant)?;
+        let mut l = (*b.lay).clone();
+        let dy = b.dy;
+        for line in &mut l.lines {
+            line.page = page;
+            line.y += dy;
+        }
+        for c in &mut l.cells {
+            c.page = page;
+            c.y += dy;
+        }
+        for f in &mut l.floats {
+            f.page = page;
+            f.y += dy;
+        }
+        for n in &mut l.nested {
+            n.1 = page;
+            n.3 += dy;
+        }
+        l.pages = self.pages;
+        l.page_w = self.page_w;
+        l.page_h = self.page_h;
+        l.page_lines = vec![0..0; self.pages];
+        if let Some(r) = l.page_lines.get_mut(page) {
+            *r = 0..l.lines.len();
+        }
+        l.notes.clear();
+        l.note_separators.clear();
+        l.hf.clear();
+        Some(l)
     }
 }
 
@@ -873,6 +920,7 @@ thread_local! {
 }
 
 /// A floating picture or shape placed on a page.
+#[derive(Clone)]
 pub struct FloatBox {
     pub page: usize,
     pub x: f32,
@@ -964,6 +1012,7 @@ fn floats_on_line(doc: &Document, pi: usize, l: &Line, para_top: f32, fr: &Frame
 }
 
 /// A laid-out footnote or endnote.
+#[derive(Clone)]
 pub struct NoteBox {
     pub page: usize,
     pub y: f32,
@@ -1003,9 +1052,8 @@ pub fn layout(doc: &Document, fonts: &mut FontsView<'_>, zoom: f32) -> Layout {
 
     // Rich headers and footers; the body moves down/up if they don't fit in the margins.
     let any = |v: [usize; 2]| (0..doc.hf.len()).any(|s| v.iter().any(|x| hf_doc(doc, s, *x).is_some()));
-    let rich_header = doc.pkg.as_ref().is_some_and(|p| p.header_text == doc.header) && any([0, 1]);
-    let rich_footer =
-        doc.pkg.as_ref().is_some_and(|p| p.footer_text == doc.footer && p.page_numbers == doc.page_numbers) && any([2, 3]);
+    let rich_header = any([0, 1]);
+    let rich_footer = any([2, 3]);
     let mut hf: Vec<HfBox> = Vec::new();
     for section in 0..doc.hf.len() {
         for variant in 0..4 {

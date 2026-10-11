@@ -1,6 +1,7 @@
 //! The page canvas: keyboard and mouse handling, and painting.
 
 use crate::app::{App, After, Tab};
+use crate::story::StoryReq;
 use crate::doc::{Align, LINE_BREAK, ListKind, OBJ, PAGE_BREAK, Pos, Rgba, Style};
 use crate::layout::{self, Layout};
 use crate::render::{self, Canvas as _};
@@ -127,6 +128,9 @@ impl App {
             }
             Key::F7 => self.start_spelling(),
             Key::Escape => {
+                if self.format_painter.is_none() && !self.find.open {
+                    self.close_story();
+                }
                 self.format_painter = None;
                 self.find.open = false;
             }
@@ -242,7 +246,7 @@ impl App {
 
     /// Width reserved to the right of the pages for comment cards.
     pub fn comments_width(&self) -> f32 {
-        if self.show_comments && !self.doc.comments.is_empty() { COMMENT_W + 2.0 * GAP } else { 0.0 }
+        if self.show_comments && !self.main_doc().comments.is_empty() { COMMENT_W + 2.0 * GAP } else { 0.0 }
     }
 
     fn page_origin(&self, rect: Rect, lay: &Layout, page: usize) -> Pos2 {
@@ -310,6 +314,28 @@ impl App {
             ui.scroll_to_rect(r, None);
         }
         self.layout = Some(lay);
+        if let Some(req) = self.story_req.take() {
+            self.apply_story_req(req);
+        }
+    }
+
+    /// Page under a screen point and whether it is in that page's header (Some(true)),
+    /// footer (Some(false)) or body area (None), judged from the body layout, plus the
+    /// page-relative point.
+    fn hf_zone(&self, rect: Rect, lay: &Layout, p: Pos2) -> (usize, Option<bool>, Pos2) {
+        let bl = self.main_layout().unwrap_or(lay);
+        let rel = p.y - rect.top() - GAP;
+        let page = ((rel / (bl.page_h + GAP)).floor().max(0.0) as usize).min(bl.pages - 1);
+        let o = self.page_origin(rect, bl, page);
+        let local = pos2(p.x - o.x, p.y - o.y);
+        let zone = if local.y < bl.margins[0] {
+            Some(true)
+        } else if local.y > bl.page_h - bl.margins[2] {
+            Some(false)
+        } else {
+            None
+        };
+        (page, zone, local)
     }
 
     fn mouse(&mut self, ui: &Ui, resp: &egui::Response, rect: Rect, lay: &Layout) {
@@ -368,6 +394,28 @@ impl App {
                 let same_spot = time - self.last_click.0 < 0.45 && self.last_click.1.distance(p) < 6.0;
                 let count = if same_spot { self.last_click.2 + 1 } else { 1 };
                 self.last_click = (time, p, count);
+                // Headers and footers: double-click to open or leave them, like Word.
+                let (zpage, zone, local) = self.hf_zone(rect, lay, p);
+                let at = Some((local.x, local.y));
+                match (self.story.as_deref(), zone) {
+                    (None, Some(header)) if count == 2 => {
+                        self.story_req = Some(StoryReq::Open { page: zpage, header, at });
+                        return;
+                    }
+                    (Some(st), z) if z != Some(st.is_header()) || zpage != st.page => {
+                        if count == 2 {
+                            self.story_req = Some(match z {
+                                Some(header) => StoryReq::Open { page: zpage, header, at },
+                                None => StoryReq::Close,
+                            });
+                        } else if z == Some(st.is_header()) {
+                            // The same header on another page.
+                            self.story_req = Some(StoryReq::Open { page: zpage, header: st.is_header(), at });
+                        }
+                        return;
+                    }
+                    _ => {}
+                }
                 let (page, pos) = self.hit_point(rect, lay, p);
                 self.goal_x = None;
                 // Ctrl+Click follows hyperlinks, like Word.
@@ -549,7 +597,9 @@ impl App {
 
     fn texture(&mut self, ctx: &egui::Context, id: u32) -> Option<egui::TextureId> {
         if !self.textures.contains_key(&id) {
-            let img = self.doc.all_images().into_iter().find(|(k, _)| *k == id).map(|(_, v)| v.clone())?;
+            let img = [self.main_doc(), &self.doc]
+                .into_iter()
+                .find_map(|d| d.all_images().into_iter().find(|(k, _)| *k == id).map(|(_, v)| v.clone()))?;
             let rgba = image::load_from_memory(&img.bytes).ok()?.to_rgba8();
             let size = [rgba.width() as usize, rgba.height() as usize];
             let ci = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
@@ -573,13 +623,20 @@ impl App {
             self.refresh_find();
         }
         let matches = if self.find.open { self.find.matches.clone() } else { Vec::new() };
-        let comment_ranges = if self.show_comments { lay.comment_ranges.clone() } else { Vec::new() };
-        let ids: Vec<u32> = self.doc.all_images().into_iter().map(|(k, _)| k).collect();
+        let mut ids: Vec<u32> = self.main_doc().all_images().into_iter().map(|(k, _)| k).collect();
+        ids.extend(self.doc.images.keys());
         for id in ids {
             self.texture(ui.ctx(), id);
         }
         let textures: HashMap<u32, egui::TextureId> = self.textures.iter().map(|(k, v)| (*k, v.id())).collect();
         let sc = lay.scale;
+        // While a header/footer is edited, `lay` is its layout and the page is drawn from the body's.
+        let story = self.story.as_deref().and_then(|s| Some((s, s.body_layout.as_ref()?)));
+        let (pdoc, play) = match story {
+            Some((s, bl)) => (&s.body, bl),
+            None => (&self.doc, lay),
+        };
+        let comment_ranges = if self.show_comments { play.comment_ranges.clone() } else { Vec::new() };
 
         for page in 0..lay.pages {
             let o = self.page_origin(rect, lay, page);
@@ -592,7 +649,7 @@ impl App {
             painter.rect_stroke(pr, 0.0, Stroke::new(1.0, Color32::from_gray(200)), StrokeKind::Outside);
 
             // Margin guides (corner marks, like Word).
-            let [mt, mr, mb, ml] = lay.margins;
+            let [mt, mr, mb, ml] = play.margins;
             let guide = Stroke::new(1.0, Color32::from_gray(190));
             for (cx, cy, dx, dy) in [
                 (ml, mt, -1.0, -1.0),
@@ -605,14 +662,58 @@ impl App {
                 painter.line_segment([c, c + vec2(0.0, dy * 12.0)], guide);
             }
             // Gridlines for borderless tables, like Word's "View Gridlines".
-            for cell in lay.cells.iter().filter(|c| c.page == page && !c.edges.iter().any(crate::doc::Border::visible)) {
+            for cell in play.cells.iter().filter(|c| c.page == page && !c.edges.iter().any(crate::doc::Border::visible)) {
                 let r = Rect::from_min_size(o + vec2(cell.x, cell.y), vec2(cell.w, cell.h));
                 painter.rect_stroke(r, 0.0, Stroke::new(1.0, Color32::from_rgb(0xC8, 0xD8, 0xEE)), StrokeKind::Inside);
             }
 
             let mut canvas = EguiCanvas { painter: &painter, origin: o, textures: &textures };
+            if let Some((st, _)) = story {
+                render::draw_page(&mut canvas, pdoc, play, page, |_, _| {});
+                // Dim the body; mark the header (footer) area on pages showing it.
+                let veil = Color32::from_rgba_unmultiplied(255, 255, 255, 140);
+                let body = Rect::from_min_max(o + vec2(0.0, play.margins[0]), o + vec2(lay.page_w, lay.page_h - play.margins[2]));
+                painter.rect_filled(body, 0.0, veil);
+                if play.hf_slot(pdoc, st.is_header(), page) == (st.section, st.variant) {
+                    let y = if st.is_header() { play.margins[0] } else { lay.page_h - play.margins[2] };
+                    let blue = Color32::from_rgb(0x2B, 0x57, 0x9A);
+                    let mut x = 0.0;
+                    while x < lay.page_w {
+                        painter.line_segment([o + vec2(x, y), o + vec2((x + 4.0).min(lay.page_w), y)], Stroke::new(1.0, blue));
+                        x += 7.0;
+                    }
+                    let font = egui::FontId::proportional(11.0);
+                    let galley = painter.layout_no_wrap(st.name(), font, Color32::WHITE);
+                    let size = galley.size() + vec2(10.0, 4.0);
+                    let tag_y = if st.is_header() { y } else { y - size.y };
+                    let tag = Rect::from_min_size(o + vec2(play.margins[3], tag_y), size);
+                    painter.rect_filled(tag, 2.0, blue);
+                    painter.galley(tag.min + vec2(5.0, 2.0), galley, Color32::WHITE);
+                }
+                // Selection in the header.
+                if has_sel {
+                    for li in lay.page_lines[page].clone() {
+                        let l = &lay.lines[li];
+                        if l.para < sa.p || l.para > sb.p {
+                            continue;
+                        }
+                        let s = if l.para == sa.p { sa.o } else { 0 }.max(l.start);
+                        let e = if l.para == sb.p { sb.o } else { usize::MAX }.min(l.end);
+                        if s > e {
+                            continue;
+                        }
+                        let (x0, mut x1) = (l.xs[s - l.start], l.xs[e - l.start]);
+                        if l.para < sb.p && l.last_in_para {
+                            x1 += 6.0;
+                        }
+                        let r = Rect::from_min_max(o + vec2(x0, l.y), o + vec2(x1, l.y + l.height));
+                        painter.rect_filled(r, 0.0, sel_color);
+                    }
+                }
+            }
             let doc = &self.doc;
             let current = self.find.current;
+            if story.is_none() {
             render::draw_page(&mut canvas, doc, lay, page, |cv, li| {
                 let l = &lay.lines[li];
                 let top = l.y;
@@ -659,6 +760,7 @@ impl App {
                     }
                 }
             });
+            }
 
             for li in lay.page_lines[page].clone() {
                 let l = &lay.lines[li];
@@ -768,8 +870,8 @@ impl App {
         if !comment_ranges.is_empty() {
             let mut next_free = f32::MIN;
             for (id, cs, _) in &comment_ranges {
-                let Some(c) = self.doc.comments.get(id) else { continue };
-                let (pg, x, y, _) = lay.caret(*cs);
+                let Some(c) = pdoc.comments.get(id) else { continue };
+                let (pg, x, y, _) = play.caret(*cs);
                 let o = self.page_origin(rect, lay, pg);
                 let anchor = o + vec2(x, y);
                 let card_x = o.x + lay.page_w + GAP;

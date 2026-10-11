@@ -74,6 +74,9 @@ struct FileDoc {
     #[serde(default)]
     package: Option<FilePackage>,
     paras: Vec<FilePara>,
+    /// Headers (true) / footers (false) created in FreeWord, as part XML.
+    #[serde(default)]
+    new_hf: Vec<(bool, String)>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -262,8 +265,10 @@ pub fn runs(p: &Para) -> Vec<(String, CharFmt)> {
 
 pub fn save_native(doc: &Document, path: &Path) -> Result<(), String> {
     let b64 = base64::engine::general_purpose::STANDARD;
+    // Edited headers/footers are stored as rewritten package parts.
+    let edited: BTreeMap<String, Vec<u8>> = crate::docx::edited_hf_parts(doc).into_iter().collect();
     let package = doc.pkg.as_ref().map(|p| FilePackage {
-        parts: p.parts.iter().map(|(k, v)| (k.clone(), b64.encode(v))).collect(),
+        parts: p.parts.iter().chain(edited.iter()).map(|(k, v)| (k.clone(), b64.encode(v))).collect(),
         root_attrs: p.root_attrs.clone(),
         body_sect: p.body_sect.clone(),
         header_text: p.header_text.clone(),
@@ -292,6 +297,7 @@ pub fn save_native(doc: &Document, path: &Path) -> Result<(), String> {
         tables: doc.tables.clone(),
         numbering: Some(doc.numbering.clone()),
         package,
+        new_hf: crate::docx::new_hf_xml(doc),
         paras: doc
             .paras
             .iter()
@@ -430,6 +436,22 @@ pub fn load_native(path: &Path) -> Result<Document, String> {
     }
     if let Some(pkg) = doc.pkg.clone() {
         doc.hf = Arc::new(crate::docx::hf_sections(&pkg.parts, &doc.section_props(), pkg.id, &doc.styles, &doc.numbering));
+        // Plain text set in FreeWord replaces the package's headers/footers.
+        if doc.header != pkg.header_text {
+            doc.clear_rich_hf(true);
+        }
+        if doc.footer != pkg.footer_text || doc.page_numbers != pkg.page_numbers {
+            doc.clear_rich_hf(false);
+        }
+    }
+    for (header, xml) in &fd.new_hf {
+        let sub = crate::docx::hf_from_xml(&doc, *header, xml);
+        let sections = doc.section_props().len().max(1);
+        let hf = Arc::make_mut(&mut doc.hf);
+        if hf.len() < sections {
+            hf.resize_with(sections, Default::default);
+        }
+        doc.put_hf(sections - 1, if *header { 0 } else { 2 }, sub);
     }
     doc.ensure_trailing_para();
     Ok(doc)

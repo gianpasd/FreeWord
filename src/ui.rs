@@ -315,6 +315,11 @@ impl eframe::App for App {
             }
         }
 
+        // Dialogs that work on the whole document leave the header/footer first.
+        if self.story.is_some() && (self.dlg.page_setup || self.dlg.header_footer || self.find.open || self.dlg.word_count) {
+            self.close_story();
+        }
+
         self.text_focus_frame = false;
         // Fonts requested last frame are now registered with egui: re-layout with them.
         if crate::fonts::commit() {
@@ -408,12 +413,17 @@ impl App {
         // Ribbon body.
         Frame::NONE.inner_margin(Margin { left: 8, right: 8, top: 4, bottom: 2 }).show(ui, |ui| {
             egui::ScrollArea::horizontal().id_salt("ribbon_scroll").show(ui, |ui| {
-                ui.horizontal_top(|ui| match self.tab {
-                    Tab::Home => self.home_tab(ui),
-                    Tab::Insert => self.insert_tab(ui),
-                    Tab::Layout => self.layout_tab(ui),
-                    Tab::Review => self.review_tab(ui),
-                    Tab::View => self.view_tab(ui),
+                ui.horizontal_top(|ui| {
+                    if self.story.is_some() {
+                        self.story_group(ui);
+                    }
+                    match self.tab {
+                        Tab::Home => self.home_tab(ui),
+                        Tab::Insert => self.insert_tab(ui),
+                        Tab::Layout => self.layout_tab(ui),
+                        Tab::Review => self.review_tab(ui),
+                        Tab::View => self.view_tab(ui),
+                    }
                 });
             });
         });
@@ -422,6 +432,32 @@ impl App {
             [pos2(r.left(), ui.min_rect().bottom()), pos2(r.right(), ui.min_rect().bottom())],
             Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
         );
+    }
+
+    /// Contextual group shown while a header or footer is being edited.
+    fn story_group(&mut self, ui: &mut Ui) {
+        let Some(st) = self.story.as_deref() else { return };
+        let (header, page, name) = (st.is_header(), st.page, st.name());
+        group(ui, "Header & Footer", |ui| {
+            ui.vertical(|ui| {
+                ui.label(RichText::new(name).strong().color(ACCENT_FOR(ui)));
+                ui.horizontal(|ui| {
+                    if small_btn(ui, "#", "Page", "Insert the page number").clicked() {
+                        self.insert_page_field(false);
+                    }
+                    if small_btn(ui, "Σ", "Pages", "Insert the number of pages").clicked() {
+                        self.insert_page_field(true);
+                    }
+                });
+                let (glyph, label) = if header { ("▁", "Go to Footer") } else { ("▔", "Go to Header") };
+                if small_btn(ui, glyph, label, "Switch between the header and the footer").clicked() {
+                    self.story_req = Some(crate::story::StoryReq::Open { page, header: !header, at: None });
+                }
+            });
+            if big_btn(ui, "✖", "Close", "Close Header and Footer (Esc)").clicked() {
+                self.story_req = Some(crate::story::StoryReq::Close);
+            }
+        });
     }
 
     fn file_menu(&mut self, ui: &mut Ui) {
@@ -792,12 +828,26 @@ impl App {
             });
         }
         group(ui, "Header & Footer", |ui| {
-            if big_btn(ui, "▤", "Header & Footer", "Edit the header and footer").clicked() {
-                self.dlg.header_footer = true;
+            let page = self.caret_page();
+            if big_btn(ui, "▔", "Header", "Edit the header (or double-click the top of a page)").clicked() {
+                self.open_hf(page, true, None);
             }
-            if big_btn_sel(ui, "#", "Page Number", self.doc.page_numbers, "Show page numbers in the footer").clicked() {
-                self.checkpoint(crate::app::EditKind::Other);
-                self.doc.page_numbers = !self.doc.page_numbers;
+            if big_btn(ui, "▁", "Footer", "Edit the footer (or double-click the bottom of a page)").clicked() {
+                self.open_hf(page, false, None);
+            }
+            if self.story.is_some() {
+                if big_btn(ui, "#", "Page Number", "Insert the page number at the cursor").clicked() {
+                    self.insert_page_field(false);
+                }
+            } else {
+                if big_btn_sel(ui, "#", "Page Number", self.doc.page_numbers, "Show page numbers in the footer").clicked() {
+                    self.checkpoint(crate::app::EditKind::Other);
+                    self.doc.page_numbers = !self.doc.page_numbers;
+                    self.doc.clear_rich_hf(false);
+                }
+                if small_btn(ui, "▤", "Quick Text…", "Set plain header and footer text").clicked() {
+                    self.dlg.header_footer = true;
+                }
             }
         });
         group(ui, "Text", |ui| {
@@ -1134,7 +1184,7 @@ impl App {
             };
             ui.label(format!("Page {page} of {pages}"));
             ui.add_space(12.0);
-            let st = self.doc.stats();
+            let st = self.main_doc().stats();
             if self.has_sel() {
                 let (a, b) = self.sel();
                 let words = self.doc.plain_text(a, b).split_whitespace().count();
@@ -1302,6 +1352,13 @@ impl App {
             });
             if header != self.doc.header || footer != self.doc.footer || nums != self.doc.page_numbers {
                 self.checkpoint(crate::app::EditKind::Typing);
+                // Plain text replaces rich headers/footers.
+                if header != self.doc.header {
+                    self.doc.clear_rich_hf(true);
+                }
+                if footer != self.doc.footer || nums != self.doc.page_numbers {
+                    self.doc.clear_rich_hf(false);
+                }
                 self.doc.header = header;
                 self.doc.footer = footer;
                 self.doc.page_numbers = nums;

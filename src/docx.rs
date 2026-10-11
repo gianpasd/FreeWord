@@ -945,7 +945,46 @@ fn hf_document(
     d.tables = tables;
     d.numbering = numbering.clone();
     d.styles = sheet.clone();
+    d.source = Some(target.to_string());
     Some(d)
+}
+
+/// A new rich header (or footer) for `doc` holding its plain-text header
+/// (or footer and page numbers), or one empty paragraph.
+pub fn hf_from_plain(doc: &Document, header: bool) -> Document {
+    let (tag, xml) = if header {
+        ("hdr", if doc.header.is_empty() { None } else { Some(hf_xml("hdr", &doc.header, false)) })
+    } else {
+        ("ftr", if doc.footer.is_empty() && !doc.page_numbers { None } else { Some(hf_xml("ftr", &doc.footer, doc.page_numbers)) })
+    };
+    let xml = xml.unwrap_or_else(|| {
+        let style = if header { "Header" } else { "Footer" };
+        let ppr = if doc.styles.styles.contains_key(style) { format!("<w:pPr><w:pStyle w:val=\"{style}\"/></w:pPr>") } else { String::new() };
+        format!("<w:{tag} xmlns:w=\"{W_NS}\" xmlns:r=\"{R_NS}\"><w:p>{ppr}</w:p></w:{tag}>")
+    });
+    hf_from_xml(doc, header, &xml)
+}
+
+/// A header (or footer) created in FreeWord, read back from its part XML.
+pub fn hf_from_xml(doc: &Document, header: bool, xml: &str) -> Document {
+    let target = format!("word/{}_fw.xml", if header { "header" } else { "footer" });
+    let parts = BTreeMap::from([(target.clone(), xml.as_bytes().to_vec())]);
+    let mut d = hf_document(&parts, &target, doc.pkg_id(), &doc.styles, &doc.numbering, 990_000_000).unwrap_or_else(Document::new);
+    d.source = None;
+    d.edited = true;
+    d
+}
+
+/// Part XML of the headers (true) / footers (false) created in FreeWord.
+pub fn new_hf_xml(doc: &Document) -> Vec<(bool, String)> {
+    let Some(h) = doc.hf.last() else { return Vec::new() };
+    [(true, &h.header), (false, &h.footer)]
+        .into_iter()
+        .filter_map(|(header, d)| {
+            let d = d.as_deref().filter(|d| d.source.is_none())?;
+            Some((header, hf_part_xml(d, doc.pkg_id(), if header { "hdr" } else { "ftr" }, &[], HashSet::new()).0))
+        })
+        .collect()
 }
 
 /// Comments (`comments.xml`) by id.
@@ -1438,7 +1477,46 @@ struct Writer<'a> {
     used_rel_ids: HashSet<String>,
 }
 
-impl Writer<'_> {
+impl<'a> Writer<'a> {
+    /// `pkg_id` is the package the document's raw XML may refer to (the main document's for headers).
+    fn new(doc: &'a Document, pkg_id: u64, used_rel_ids: HashSet<String>) -> Self {
+        let mut w = Writer {
+            doc,
+            pkg_id,
+            cache: DiffCache::default(),
+            rels: Vec::new(),
+            link_rels: HashMap::new(),
+            image_rels: HashMap::new(),
+            media: Vec::new(),
+            doc_pr_id: 0,
+            drop_markers: HashSet::new(),
+            used_rel_ids,
+        };
+        w.balance_fields();
+        w
+    }
+
+    /// Paragraphs and tables of the whole document.
+    fn blocks_xml(&mut self) -> String {
+        let doc = self.doc;
+        let mut out = String::new();
+        let mut i = 0;
+        while i < doc.paras.len() {
+            if let Some(c) = doc.paras[i].cell {
+                let mut e = i;
+                while e < doc.paras.len() && doc.paras[e].cell.is_some_and(|x| x.table == c.table) {
+                    e += 1;
+                }
+                self.table_xml(c.table, i..e, &mut out);
+                i = e;
+            } else {
+                self.para_xml(i, &mut out);
+                i += 1;
+            }
+        }
+        out
+    }
+
     fn new_rel(&mut self, kind: &str, target: &str, external: bool) -> String {
         let mut n = self.rels.len() + 1;
         let mut id = format!("rIdFw{n}");
@@ -1478,6 +1556,8 @@ impl Writer<'_> {
         let mut stack: Vec<((usize, usize), bool)> = Vec::new(); // (pos, has separator)
         let mut seps: Vec<(usize, usize)> = Vec::new();
         let mut drop = HashSet::new();
+        // Each footnote/endnote may be referenced once (copy & paste can duplicate references).
+        let mut note_refs: HashSet<(bool, String)> = HashSet::new();
         for (pi, p) in self.doc.paras.iter().enumerate() {
             // Wrappers (tracked insertions) must open and close within a paragraph.
             let mut wraps: Vec<usize> = Vec::new();
@@ -1508,6 +1588,11 @@ impl Writer<'_> {
                     }
                     ObjKind::FieldEnd => {
                         if stack.pop().is_none() {
+                            drop.insert((pi, ci));
+                        }
+                    }
+                    ObjKind::NoteRef { endnote, ref id } if id != "self" => {
+                        if !note_refs.insert((endnote, id.clone())) {
                             drop.insert((pi, ci));
                         }
                     }
@@ -2112,6 +2197,69 @@ fn patch_rels(original: &str, rels: &[(String, String, String, bool)]) -> String
     s
 }
 
+/// Header/footer part XML for a sub-document, with the relationships and media it adds.
+/// `root_attrs` are the original root element's attributes (namespace declarations).
+fn hf_part_xml(
+    sub: &Document,
+    pkg_id: u64,
+    tag: &str,
+    root_attrs: &[(String, String)],
+    used: HashSet<String>,
+) -> (String, Vec<(String, String, String, bool)>, Vec<(String, Arc<Vec<u8>>)>) {
+    let mut sub = sub.clone();
+    sub.ensure_trailing_para();
+    let mut w = Writer::new(&sub, pkg_id, used);
+    let body = w.blocks_xml();
+    let mut attrs: Vec<(String, String)> = root_attrs.to_vec();
+    for (k, v) in [
+        ("xmlns:w", W_NS),
+        ("xmlns:r", R_NS),
+        ("xmlns:wp", "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"),
+        ("xmlns:a", "http://schemas.openxmlformats.org/drawingml/2006/main"),
+        ("xmlns:pic", "http://schemas.openxmlformats.org/drawingml/2006/picture"),
+    ] {
+        if !attrs.iter().any(|(a, _)| a == k) {
+            attrs.push((k.into(), v.into()));
+        }
+    }
+    let attr_s: String = attrs.iter().map(|(k, v)| format!(" {k}=\"{}\"", esc(v))).collect();
+    let xml = format!("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<w:{tag}{attr_s}>{body}</w:{tag}>");
+    (xml, w.rels, w.media)
+}
+
+/// Rewritten parts (and their relationships and media) for every edited
+/// header/footer that was read from the package.
+pub fn edited_hf_parts(doc: &Document) -> Vec<(String, Vec<u8>)> {
+    let mut out = Vec::new();
+    let Some(pkg) = doc.pkg.as_deref() else { return out };
+    let mut done = HashSet::new();
+    for sub in doc.hf.iter().flat_map(|h| [&h.header, &h.header_first, &h.footer, &h.footer_first]).flatten() {
+        let Some(target) = sub.source.as_ref().filter(|_| sub.edited) else { continue };
+        if !done.insert(target.clone()) {
+            continue;
+        }
+        let Some(orig) = part_xml(&pkg.parts, target) else { continue };
+        let tag = if orig.name == "ftr" { "ftr" } else { "hdr" };
+        let (dir, file) = target.rsplit_once('/').unwrap_or(("", target));
+        let rels_name = if dir.is_empty() { format!("_rels/{file}.rels") } else { format!("{dir}/_rels/{file}.rels") };
+        let orig_rels = pkg.parts.get(&rels_name).map(|b| String::from_utf8_lossy(b).to_string()).unwrap_or_default();
+        let used: HashSet<String> = xml::parse(&orig_rels)
+            .map(|r| r.elems().filter_map(|e| e.attr("Id").map(|s| s.to_string())).collect())
+            .unwrap_or_default();
+        let (xml, rels, media) = hf_part_xml(sub, pkg.id, tag, &orig.attrs, used);
+        out.push((target.clone(), xml.into_bytes()));
+        if !rels.is_empty() {
+            out.push((rels_name, patch_rels(&orig_rels, &rels).into_bytes()));
+        }
+        // Media paths are relative to the part's folder.
+        out.extend(media.into_iter().map(|(n, b)| {
+            let n = n.strip_prefix("word/").unwrap_or(&n);
+            (if dir.is_empty() { n.to_string() } else { format!("{dir}/{n}") }, b.to_vec())
+        }));
+    }
+    out
+}
+
 pub fn save_docx(doc: &Document, path: &Path) -> Result<(), String> {
     let bytes = docx_bytes(doc)?;
     // Write to a temporary file first so a failure never destroys the original.
@@ -2139,48 +2287,47 @@ pub fn docx_bytes(doc: &Document) -> Result<Vec<u8>, String> {
             }
         }
     }
-    let mut w = Writer {
-        doc,
-        pkg_id: doc.pkg_id(),
-        cache: DiffCache::default(),
-        rels: Vec::new(),
-        link_rels: HashMap::new(),
-        image_rels: HashMap::new(),
-        media: Vec::new(),
-        doc_pr_id: 0,
-        drop_markers: HashSet::new(),
-        used_rel_ids: used,
-    };
-    w.balance_fields();
+    let mut w = Writer::new(doc, doc.pkg_id(), used);
+    let body = w.blocks_xml();
 
-    // Body.
-    let mut body = String::new();
-    if let Some(bg) = pkg.and_then(|p| p.background.as_ref()) {
-        let _ = bg; // written before the body below
+    // Header/footer: keep the originals unless the user edited them. Headers
+    // created in FreeWord (rich, or plain text) become new default parts of the last section.
+    let last_hf = doc.hf.last();
+    fn rich_new(d: &Option<Box<Document>>) -> Option<&Document> {
+        d.as_deref().filter(|d| d.source.is_none())
     }
-    let mut i = 0;
-    while i < doc.paras.len() {
-        if let Some(c) = doc.paras[i].cell {
-            let mut e = i;
-            while e < doc.paras.len() && doc.paras[e].cell.is_some_and(|x| x.table == c.table) {
-                e += 1;
-            }
-            w.table_xml(c.table, i..e, &mut body);
-            i = e;
-        } else {
-            w.para_xml(i, &mut body);
-            i += 1;
-        }
-    }
-
-    // Header/footer: keep the originals unless the user edited them.
+    let rich_header = last_hf.and_then(|h| rich_new(&h.header));
+    let rich_footer = last_hf.and_then(|h| rich_new(&h.footer));
     let hf_changed = |pkg: &Package| {
         (doc.header != pkg.header_text, doc.footer != pkg.footer_text || doc.page_numbers != pkg.page_numbers)
     };
-    let (new_header, new_footer) = match pkg {
+    let (plain_header, plain_footer) = match pkg {
         Some(p) => hf_changed(p),
         None => (!doc.header.is_empty(), !doc.footer.is_empty() || doc.page_numbers),
     };
+    let mut hf_out: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut new_part = |rich: Option<&Document>, plain: bool, header: bool| -> bool {
+        let (tag, name) = if header { ("hdr", "header_fw.xml") } else { ("ftr", "footer_fw.xml") };
+        let xml = match rich {
+            Some(d) => {
+                let (xml, rels, media) = hf_part_xml(d, doc.pkg_id(), tag, &[], HashSet::new());
+                if !rels.is_empty() {
+                    hf_out.push((format!("word/_rels/{name}.rels"), patch_rels("", &rels).into_bytes()));
+                }
+                hf_out.extend(media.into_iter().map(|(n, b)| (n, b.to_vec())));
+                xml
+            }
+            None if plain => {
+                if header { hf_xml("hdr", &doc.header, false) } else { hf_xml("ftr", &doc.footer, doc.page_numbers) }
+            }
+            None => return false,
+        };
+        hf_out.push((format!("word/{name}"), xml.into_bytes()));
+        true
+    };
+    let new_header = new_part(rich_header, plain_header, true);
+    let new_footer = new_part(rich_footer, plain_footer, false);
+    hf_out.extend(edited_hf_parts(doc));
     let header_rel = new_header.then(|| w.new_rel("header", "header_fw.xml", false));
     let footer_rel = new_footer.then(|| w.new_rel("footer", "footer_fw.xml", false));
     let sect = section_xml(doc, pkg.and_then(|p| p.body_sect.as_deref()), header_rel.as_deref(), footer_rel.as_deref());
@@ -2206,7 +2353,7 @@ pub fn docx_bytes(doc: &Document) -> Result<Vec<u8>, String> {
 
     // Assemble the package.
     let mut parts: BTreeMap<String, Vec<u8>> = BTreeMap::new();
-    let numbering_used = doc.paras.iter().any(|p| p.list != ListKind::None);
+    let numbering_used = doc.paras.iter().chain(doc.hf_docs().flat_map(|d| d.paras.iter())).any(|p| p.list != ListKind::None);
     match pkg {
         Some(p) => {
             for (k, v) in &p.parts {
@@ -2228,11 +2375,9 @@ pub fn docx_bytes(doc: &Document) -> Result<Vec<u8>, String> {
                 None => {}
             }
             if new_header {
-                parts.insert("word/header_fw.xml".into(), hf_xml("hdr", &doc.header, false).into_bytes());
                 overrides.push(("/word/header_fw.xml", "application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml"));
             }
             if new_footer {
-                parts.insert("word/footer_fw.xml".into(), hf_xml("ftr", &doc.footer, doc.page_numbers).into_bytes());
                 overrides.push(("/word/footer_fw.xml", "application/vnd.openxmlformats-officedocument.wordprocessingml.footer+xml"));
             }
             let orig_rels = p.parts.get(orig_rels_name).map(|b| String::from_utf8_lossy(b).to_string()).unwrap_or_default();
@@ -2267,12 +2412,6 @@ pub fn docx_bytes(doc: &Document) -> Result<Vec<u8>, String> {
                 )
                 .into_bytes(),
             );
-            if new_header {
-                parts.insert("word/header_fw.xml".into(), hf_xml("hdr", &doc.header, false).into_bytes());
-            }
-            if new_footer {
-                parts.insert("word/footer_fw.xml".into(), hf_xml("ftr", &doc.footer, doc.page_numbers).into_bytes());
-            }
             parts.insert("[Content_Types].xml".into(), content_types_new(new_header, new_footer).into_bytes());
             let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
             parts.insert(
@@ -2291,6 +2430,7 @@ pub fn docx_bytes(doc: &Document) -> Result<Vec<u8>, String> {
         }
     }
     parts.insert(main_part.into(), document.into_bytes());
+    parts.extend(hf_out);
     for (name, bytes) in &w.media {
         parts.insert(name.clone(), bytes.to_vec());
     }

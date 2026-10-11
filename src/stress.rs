@@ -80,7 +80,7 @@ pub fn run(input: &Path, output: &Path, seed: u64, steps: usize) -> Result<(), S
         } else {
             app.set_cursor(a, false);
         }
-        let op = r.below(40);
+        let op = r.below(44);
         let name = format!("op{op}");
         match op {
             0..=5 => app.insert_typed(WORDS[r.below(WORDS.len())]),
@@ -140,15 +140,29 @@ pub fn run(input: &Path, output: &Path, seed: u64, steps: usize) -> Result<(), S
                 }
             }
             38 => app.insert_line_break(),
-            _ => {
+            39 => {
                 app.find.query = "a".into();
                 app.find.replacement = "A".into();
                 app.invalidate_find();
                 app.replace_all();
             }
+            // Headers and footers: later operations edit them until closed.
+            40 | 41 => {
+                app.ensure_layout();
+                let pages = app.main_layout().map(|l| l.pages).unwrap_or(1);
+                app.open_hf(r.below(pages), op == 40, None);
+            }
+            42 => app.close_story(),
+            _ => {
+                if app.story.is_some() {
+                    app.insert_page_field(r.chance(50));
+                }
+            }
         }
         check(&app, step, &name);
     }
+    app.close_story();
+    check(&app, steps, "close");
     crate::docx::save_docx(&app.doc, output)?;
     // The saved file must load again.
     let back = crate::docx::load_docx(output)?;

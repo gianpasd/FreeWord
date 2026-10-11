@@ -27,10 +27,10 @@ pub enum EditKind {
 }
 
 #[derive(Clone)]
-struct Snap {
-    doc: Document,
-    cursor: Pos,
-    anchor: Pos,
+pub(crate) struct Snap {
+    pub doc: Document,
+    pub cursor: Pos,
+    pub anchor: Pos,
 }
 
 pub struct Clip {
@@ -98,8 +98,8 @@ pub struct App {
     pub anchor: Pos,
     pub goal_x: Option<f32>,
     pub pending_fmt: Option<CharFmt>,
-    undo: Vec<Snap>,
-    redo: Vec<Snap>,
+    pub(crate) undo: Vec<Snap>,
+    pub(crate) redo: Vec<Snap>,
     last_kind: EditKind,
     last_edit: Instant,
     pub rev: u64,
@@ -134,6 +134,9 @@ pub struct App {
     pub spell: crate::spell::Speller,
     /// Misspelled word under the last right-click: (start, end, suggestions).
     pub ctx_word: Option<(Pos, Pos, Vec<String>)>,
+    /// Header or footer being edited (its document is `doc` meanwhile).
+    pub story: Option<Box<crate::story::Story>>,
+    pub story_req: Option<crate::story::StoryReq>,
 }
 
 /// Loads a document by extension.
@@ -230,6 +233,8 @@ impl App {
             viewport_h: 600.0,
             spell: crate::spell::Speller::new(),
             ctx_word: None,
+            story: None,
+            story_req: None,
         }
     }
 
@@ -340,6 +345,17 @@ impl App {
     pub fn ensure_layout(&mut self) {
         let key = (self.rev, self.zoom.to_bits());
         if self.layout.is_none() || self.layout_key != key {
+            if self.story.is_some() {
+                match self.story_layouts() {
+                    Some(l) => {
+                        self.layout = Some(l);
+                        self.layout_key = key;
+                        return;
+                    }
+                    None => self.close_story(),
+                }
+            }
+            let key = (self.rev, self.zoom.to_bits());
             let doc = &self.doc;
             let zoom = self.zoom;
             let lay = self.ctx.fonts_mut(|f| layout::layout(doc, f, zoom));
@@ -989,6 +1005,7 @@ impl App {
 
     /// Opens the Spelling dialog at the next error (F7).
     pub fn start_spelling(&mut self) {
+        self.close_story();
         self.dlg.spelling = true;
         self.dlg.spell_done = false;
         let from = self.sel().0;
@@ -1577,6 +1594,7 @@ impl App {
 
     fn reset_with(&mut self, doc: Document, path: Option<PathBuf>) {
         crate::fonts::request(&self.ctx, crate::fonts::used_by(&doc));
+        self.story = None;
         self.doc = doc;
         self.path = path;
         self.dirty = false;
@@ -1668,6 +1686,7 @@ impl App {
     }
 
     fn save_to(&mut self, path: &Path) -> bool {
+        self.close_story();
         let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
         let res = match ext.as_str() {
             "fwd" => io::save_native(&self.doc, path),
@@ -1696,6 +1715,7 @@ impl App {
     }
 
     pub fn export_pdf(&mut self) {
+        self.close_story();
         let stem = self.path.as_ref().and_then(|p| p.file_stem()).map(|s| s.to_string_lossy().to_string());
         let Some(mut path) = rfd::FileDialog::new()
             .add_filter("PDF", &["pdf"])
@@ -1714,6 +1734,7 @@ impl App {
     }
 
     pub fn export_html(&mut self) {
+        self.close_story();
         let Some(mut path) = rfd::FileDialog::new().add_filter("Web Page", &["html", "htm"]).save_file() else {
             return;
         };
@@ -1727,6 +1748,7 @@ impl App {
     }
 
     pub fn export_text(&mut self) {
+        self.close_story();
         let Some(mut path) = rfd::FileDialog::new().add_filter("Plain Text", &["txt"]).save_file() else {
             return;
         };
@@ -1741,6 +1763,7 @@ impl App {
 
     /// Renders to a temporary PDF and opens it in the system viewer for printing.
     pub fn print(&mut self) {
+        self.close_story();
         let path = std::env::temp_dir().join(format!("FreeWord-print-{}.pdf", std::process::id()));
         match self.write_pdf(&path).and_then(|_| io::open_with_system(&path)) {
             Ok(()) => self.set_status("Opened print preview (PDF) — print from your PDF viewer"),
