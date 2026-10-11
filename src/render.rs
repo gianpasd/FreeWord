@@ -59,23 +59,29 @@ fn leader<C: Canvas>(c: &mut C, x0: f32, x1: f32, base: f32, kind: Leader, f: &C
 }
 
 /// Shifts drawing vertically (used to place footers).
-struct Offset<'a, C: Canvas> {
-    inner: &'a mut C,
+/// Overlay callback that draws nothing (a named fn keeps recursive calls monomorphic).
+fn no_overlay(_: &mut Offset<'_>, _: usize) {}
+
+/// Shifts drawing (headers, footers, notes, nested tables). Type-erased so
+/// nested use does not create ever-growing generic types.
+struct Offset<'a> {
+    inner: &'a mut dyn Canvas,
+    dx: f32,
     dy: f32,
 }
 
-impl<C: Canvas> Canvas for Offset<'_, C> {
+impl Canvas for Offset<'_> {
     fn rect(&mut self, x: f32, y: f32, w: f32, h: f32, c: Rgba) {
-        self.inner.rect(x, y + self.dy, w, h, c);
+        self.inner.rect(x + self.dx, y + self.dy, w, h, c);
     }
     fn line(&mut self, x0: f32, y0: f32, x1: f32, y1: f32, width: f32, c: Rgba) {
-        self.inner.line(x0, y0 + self.dy, x1, y1 + self.dy, width, c);
+        self.inner.line(x0 + self.dx, y0 + self.dy, x1 + self.dx, y1 + self.dy, width, c);
     }
     fn text(&mut self, x: f32, y: f32, text: &str, f: &CharFmt, size: f32) {
-        self.inner.text(x, y + self.dy, text, f, size);
+        self.inner.text(x + self.dx, y + self.dy, text, f, size);
     }
     fn image(&mut self, id: u32, x: f32, y: f32, w: f32, h: f32) {
-        self.inner.image(id, x, y + self.dy, w, h);
+        self.inner.image(id, x + self.dx, y + self.dy, w, h);
     }
 }
 
@@ -94,7 +100,7 @@ pub fn draw_page<C: Canvas>(c: &mut C, doc: &Document, lay: &Layout, page: usize
     }
     for n in lay.notes.iter().filter(|n| n.page == page) {
         if let Some(d) = doc.notes.get(&n.key) {
-            let mut oc = Offset { inner: &mut *c, dy: n.y };
+            let mut oc = Offset { inner: &mut *c, dx: 0.0, dy: n.y };
             draw_content(&mut oc, d, &n.lay, 0, (page + 1, pages), |_, _| {});
         }
     }
@@ -102,7 +108,7 @@ pub fn draw_page<C: Canvas>(c: &mut C, doc: &Document, lay: &Layout, page: usize
         let rich = if header { lay.rich_header } else { lay.rich_footer };
         if rich {
             if let Some((b, d)) = lay.hf_for(doc, header, page) {
-                let mut oc = Offset { inner: &mut *c, dy: b.dy };
+                let mut oc = Offset { inner: &mut *c, dx: 0.0, dy: b.dy };
                 for p in 0..b.lay.pages {
                     draw_content(&mut oc, d, &b.lay, p, (page + 1, pages), |_, _| {});
                 }
@@ -174,6 +180,16 @@ fn draw_content<C: Canvas>(
             }
         }
         under(c, li);
+        if let Some(sub) = &para.nested {
+            // Nested table drawn in place of its placeholder paragraph.
+            if let Some((_, _, x, y, nl)) = lay.nested.iter().find(|n| n.0 == l.para && n.1 == page) {
+                let mut oc = Offset { inner: &mut *c, dx: *x, dy: *y };
+                for p in 0..nl.pages {
+                    draw_content(&mut oc, sub, nl, p, page_no, no_overlay);
+                }
+            }
+            continue;
+        }
         para_borders(c, doc, lay, l);
         draw_line(c, doc, lay, l, page_no);
     }

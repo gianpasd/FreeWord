@@ -89,6 +89,8 @@ pub struct Layout {
     pub note_separators: Vec<(usize, f32)>,
     /// Floating pictures and shapes.
     pub floats: Vec<FloatBox>,
+    /// Nested tables: (paragraph, page, x, y, layout).
+    pub nested: Vec<(usize, usize, f32, f32, Box<Layout>)>,
 }
 
 type BTreeMapPages = std::collections::BTreeMap<usize, Vec<((bool, String), Box<Layout>, f32)>>;
@@ -978,6 +980,7 @@ pub fn layout(doc: &Document, fonts: &mut FontsView<'_>, zoom: f32) -> Layout {
         bands: Vec::new(),
     };
     let mut floats: Vec<FloatBox> = Vec::new();
+    let mut nested: Vec<(usize, usize, f32, f32, Box<Layout>)> = Vec::new();
     let page_margins = doc.page.margins.map(|m| m * sc);
     // Footnotes per page: (page, key, layout, height).
     let mut page_notes: Vec<(usize, (bool, String), Box<Layout>, f32)> = Vec::new();
@@ -1037,6 +1040,7 @@ pub fn layout(doc: &Document, fonts: &mut FontsView<'_>, zoom: f32) -> Layout {
                 let row_props = table.rows.get(&row).cloned().unwrap_or_default();
                 // Lay out each cell of the row.
                 let mut row_cells: Vec<(doc::CellRef, Vec<(usize, ParaLines, f32)>, f32)> = Vec::new();
+                let mut nested_here: HashMap<usize, Box<Layout>> = HashMap::new();
                 while k < range.end && doc.paras[k].cell.unwrap().row == row {
                     let cref = doc.paras[k].cell.unwrap();
                     let cp = table.cell(cref.row, cref.col);
@@ -1054,7 +1058,39 @@ pub fn layout(doc: &Document, fonts: &mut FontsView<'_>, zoom: f32) -> Layout {
                         if !first {
                             cy += prev_after + p.space_before * sc;
                         }
-                        let pl = ctx.para(doc, k, labels[k].as_ref(), inner_l, inner_r);
+                        let pl = match &p.nested {
+                            Some(sub) => {
+                                // A nested table: lay it out at the cell's inner width.
+                                let mut d = (**sub).clone();
+                                d.page = doc.page.clone();
+                                d.page.width = (inner_r - inner_l) / sc;
+                                d.page.height = 20000.0;
+                                d.page.margins = [0.0; 4];
+                                let nl = Box::new(layout(&d, ctx.fonts, zoom));
+                                let h = content_height(&nl).max(4.0 * sc);
+                                let len = p.chars.len();
+                                nested_here.insert(k, nl);
+                                ParaLines {
+                                    lines: vec![Line {
+                                        para: k,
+                                        start: 0,
+                                        end: len,
+                                        page: 0,
+                                        y: 0.0,
+                                        height: h,
+                                        baseline: h,
+                                        xs: vec![inner_l; len + 1],
+                                        last_in_para: true,
+                                        forced: false,
+                                        leaders: Vec::new(),
+                                    }],
+                                    marker: None,
+                                    left: inner_l,
+                                    right: inner_r,
+                                }
+                            }
+                            None => ctx.para(doc, k, labels[k].as_ref(), inner_l, inner_r),
+                        };
                         let h: f32 = pl.lines.iter().map(|l| l.height).sum();
                         paras_in_cell.push((k, pl, cy));
                         cy += h;
@@ -1117,6 +1153,9 @@ pub fn layout(doc: &Document, fonts: &mut FontsView<'_>, zoom: f32) -> Layout {
                             l.y += top + py + dy;
                             let fr = Frame { pw, ph, margins: page_margins, col_left: pl.left, col_w: pl.right - pl.left, sc };
                             floats.extend(floats_on_line(doc, idx, &l, para_top, &fr));
+                            if let Some(nl) = nested_here.remove(&idx) {
+                                nested.push((idx, page, pl.left, l.y, nl));
+                            }
                             lines.push(l);
                         }
                         boxes[idx] = Some(ParaBox { lines: first_line..lines.len(), left: pl.left, right: pl.right, marker: pl.marker });
@@ -1390,6 +1429,7 @@ pub fn layout(doc: &Document, fonts: &mut FontsView<'_>, zoom: f32) -> Layout {
         notes,
         note_separators: separators,
         floats,
+        nested,
     }
 }
 

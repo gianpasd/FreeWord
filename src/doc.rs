@@ -552,6 +552,8 @@ pub struct Para {
     pub cell: Option<CellRef>,
     /// Opaque block-level XML this paragraph stands in for (e.g. nested tables).
     pub raw_block: Option<String>,
+    /// Parsed nested table for display (its XML is `raw_block`).
+    pub nested: Option<Arc<Document>>,
     /// Format of the paragraph mark (used when the paragraph is empty).
     pub end_fmt: CharFmt,
 }
@@ -588,6 +590,7 @@ impl Para {
             ppr_extra: String::new(),
             cell: None,
             raw_block: None,
+            nested: None,
             end_fmt: style.char_fmt(),
         }
     }
@@ -604,6 +607,7 @@ impl Para {
     pub fn empty_like(&self) -> Self {
         let mut p = Para { chars: Vec::new(), fmts: Vec::new(), ..self.clone() };
         p.raw_block = None;
+        p.nested = None;
         p.page_break_before = false;
         if p.sect_break {
             // The section break stays with the original paragraph.
@@ -813,6 +817,7 @@ impl Document {
             .flatten()
             .map(|b| b.as_ref())
             .chain(self.notes.values())
+            .chain(self.paras.iter().filter_map(|p| p.nested.as_deref()))
     }
 
     /// Raw `w:sectPr` of every section in order (paragraph-level ones, then the body's).

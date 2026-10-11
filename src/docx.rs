@@ -81,6 +81,7 @@ fn tw(v: f32) -> i32 {
 
 // ================================================================ import
 
+#[derive(Clone)]
 struct Rel {
     kind: String,
     target: String,
@@ -442,6 +443,7 @@ impl Reader<'_> {
             let mut p = Para::new(Style::Normal);
             p.cell = Some(cell);
             p.raw_block = Some(el.to_xml());
+            p.nested = self.nested_doc(el).map(Arc::new);
             let label = format!("[Nested table: {}]", el.run_text().chars().take(60).collect::<String>());
             let mut f = self.sheet.char_fmt(None, None);
             f.color = [0x80, 0x80, 0x80, 255];
@@ -636,6 +638,39 @@ impl Reader<'_> {
             t.grid.push(72.0);
         }
         self.tables.insert(id, t);
+    }
+
+    /// A nested table as its own document (rendered inside the outer cell).
+    fn nested_doc(&self, el: &El) -> Option<Document> {
+        let base = 200_000_000 + self.images.len() as u32 * 1000 + (el.to_xml().len() as u32 % 997) * 10_000;
+        let mut r = Reader {
+            parts: self.parts,
+            rels: self.rels.clone(),
+            sheet: self.sheet,
+            numbering: self.numbering,
+            pkg: self.pkg,
+            images: BTreeMap::new(),
+            tables: BTreeMap::new(),
+            pending: Vec::new(),
+            image_base: base,
+        };
+        let mut paras = Vec::new();
+        r.table(el, &mut paras, None);
+        if paras.is_empty() {
+            return None;
+        }
+        let mut d = Document::new();
+        d.paras = paras;
+        d.images = std::mem::take(&mut r.images);
+        d.tables = std::mem::take(&mut r.tables);
+        d.numbering = self.numbering.clone();
+        d.styles = Arc::new(self.sheet.clone());
+        d.ensure_trailing_para();
+        // No trailing empty paragraph inside a cell.
+        if d.paras.last().is_some_and(|p| p.cell.is_none() && p.chars.is_empty()) && d.paras.len() > 1 {
+            d.paras.pop();
+        }
+        Some(d)
     }
 
     fn block_children(&mut self, el: &El, out: &mut Vec<Para>, cell: Option<CellRef>, tbl_style: Option<&CellFmt>) {
