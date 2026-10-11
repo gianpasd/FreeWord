@@ -787,6 +787,9 @@ pub struct Document {
     pub source: Option<String>,
     /// A header/footer sub-document changed since it was read (its part is rewritten on save).
     pub edited: bool,
+    /// Object scope of a sub-document without a package: raw XML from its part may
+    /// only refer to that part's relationships (see `pool::RawObj::pkg`).
+    pub part_pkg: u64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -824,6 +827,7 @@ impl Document {
             pkg: None,
             source: None,
             edited: false,
+            part_pkg: 0,
         }
     }
 
@@ -898,7 +902,7 @@ impl Document {
     }
 
     pub fn pkg_id(&self) -> u64 {
-        self.pkg.as_ref().map(|p| p.id).unwrap_or(0)
+        self.pkg.as_ref().map(|p| p.id).unwrap_or(self.part_pkg)
     }
 
     pub fn next_image_id(&self) -> u32 {

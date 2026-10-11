@@ -437,10 +437,14 @@ impl App {
     /// Contextual group shown while a header or footer is being edited.
     fn story_group(&mut self, ui: &mut Ui) {
         let Some(st) = self.story.as_deref() else { return };
-        let (header, page, name) = (st.is_header(), st.page, st.name());
-        group(ui, "Header & Footer", |ui| {
+        let (header, page, name, is_hf) = (st.zone() == crate::story::Zone::Header, st.page, st.name(), st.is_hf());
+        let title = if is_hf { "Header & Footer" } else { "Notes" };
+        group(ui, title, |ui| {
             ui.vertical(|ui| {
                 ui.label(RichText::new(name).strong().color(ACCENT_FOR(ui)));
+                if !is_hf {
+                    return;
+                }
                 ui.horizontal(|ui| {
                     if small_btn(ui, "#", "Page", "Insert the page number").clicked() {
                         self.insert_page_field(false);
@@ -454,8 +458,9 @@ impl App {
                     self.story_req = Some(crate::story::StoryReq::Open { page, header: !header, at: None });
                 }
             });
-            if big_btn(ui, "✖", "Close", "Close Header and Footer (Esc)").clicked() {
-                self.story_req = Some(crate::story::StoryReq::Close);
+            let tip = if is_hf { "Close Header and Footer (Esc)" } else { "Return to the document (Esc)" };
+            if big_btn(ui, "✖", "Close", tip).clicked() {
+                self.story_req = Some(crate::story::StoryReq::Close { at: None });
             }
         });
     }
@@ -827,6 +832,14 @@ impl App {
                 });
             });
         }
+        group(ui, "Footnotes", |ui| {
+            if big_btn(ui, "¹", "Footnote", "Insert a footnote at the cursor (Ctrl+Alt+F)").clicked() {
+                self.insert_note(false);
+            }
+            if big_btn(ui, "ⁱ", "Endnote", "Insert an endnote at the cursor (Ctrl+Alt+D)").clicked() {
+                self.insert_note(true);
+            }
+        });
         group(ui, "Header & Footer", |ui| {
             let page = self.caret_page();
             if big_btn(ui, "▔", "Header", "Edit the header (or double-click the top of a page)").clicked() {

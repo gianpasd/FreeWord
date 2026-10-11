@@ -946,6 +946,7 @@ fn hf_document(
     d.numbering = numbering.clone();
     d.styles = sheet.clone();
     d.source = Some(target.to_string());
+    d.part_pkg = pkg_id;
     Some(d)
 }
 
@@ -969,7 +970,7 @@ pub fn hf_from_plain(doc: &Document, header: bool) -> Document {
 pub fn hf_from_xml(doc: &Document, header: bool, xml: &str) -> Document {
     let target = format!("word/{}_fw.xml", if header { "header" } else { "footer" });
     let parts = BTreeMap::from([(target.clone(), xml.as_bytes().to_vec())]);
-    let mut d = hf_document(&parts, &target, doc.pkg_id(), &doc.styles, &doc.numbering, 990_000_000).unwrap_or_else(Document::new);
+    let mut d = hf_document(&parts, &target, pool::new_pkg_id(), &doc.styles, &doc.numbering, 990_000_000).unwrap_or_else(Document::new);
     d.source = None;
     d.edited = true;
     d
@@ -982,7 +983,7 @@ pub fn new_hf_xml(doc: &Document) -> Vec<(bool, String)> {
         .into_iter()
         .filter_map(|(header, d)| {
             let d = d.as_deref().filter(|d| d.source.is_none())?;
-            Some((header, hf_part_xml(d, doc.pkg_id(), if header { "hdr" } else { "ftr" }, &[], HashSet::new()).0))
+            Some((header, hf_part_xml(d, if header { "hdr" } else { "ftr" }, &[], HashSet::new()).0))
         })
         .collect()
 }
@@ -1017,7 +1018,6 @@ pub fn comments_from_parts(parts: &BTreeMap<String, Vec<u8>>) -> BTreeMap<String
 /// Footnote and endnote texts (`footnotes.xml`, `endnotes.xml`) by (is endnote, id).
 pub fn notes_from_parts(
     parts: &BTreeMap<String, Vec<u8>>,
-    pkg_id: u64,
     sheet: &Arc<StyleSheet>,
     numbering: &Numbering,
 ) -> BTreeMap<(bool, String), Document> {
@@ -1032,6 +1032,8 @@ pub fn notes_from_parts(
     for (kind, tag, endnote) in [("footnotes", "footnote", false), ("endnotes", "endnote", true)] {
         let Some(target) = rels.values().find(|r| r.kind == kind).map(|r| r.target.clone()) else { continue };
         let Some(root) = part_xml(parts, &target) else { continue };
+        // Raw XML in notes refers to the notes part's relationships.
+        let part_pkg = pool::new_pkg_id();
         for note in root.elems().filter(|e| e.name == tag) {
             // Separators are not notes.
             if note.attr("type").is_some_and(|t| t != "normal") {
@@ -1043,7 +1045,7 @@ pub fn notes_from_parts(
                 rels: read_rels(parts, &target),
                 sheet,
                 numbering,
-                pkg: pkg_id,
+                pkg: part_pkg,
                 images: BTreeMap::new(),
                 tables: BTreeMap::new(),
                 pending: Vec::new(),
@@ -1066,6 +1068,8 @@ pub fn notes_from_parts(
             d.tables = tables;
             d.numbering = numbering.clone();
             d.styles = sheet.clone();
+            d.source = Some(target.clone());
+            d.part_pkg = part_pkg;
             out.insert((endnote, id.to_string()), d);
             base += 10_000;
         }
@@ -1078,7 +1082,6 @@ pub fn notes_from_parts(
 pub fn hf_sections(
     parts: &BTreeMap<String, Vec<u8>>,
     sects: &[String],
-    pkg_id: u64,
     sheet: &Arc<StyleSheet>,
     numbering: &Numbering,
 ) -> Vec<crate::doc::HeaderFooter> {
@@ -1115,7 +1118,7 @@ pub fn hf_sections(
                 .entry(target.clone())
                 .or_insert_with(|| {
                     base += 1_000_000;
-                    hf_document(parts, &target, pkg_id, sheet, numbering, base).map(Box::new)
+                    hf_document(parts, &target, pool::new_pkg_id(), sheet, numbering, base).map(Box::new)
                 })
                 .clone()
         };
@@ -1266,8 +1269,8 @@ pub fn load_docx_bytes(bytes: &[u8]) -> Result<Document, String> {
     if let Some(b) = &pkg.body_sect {
         sects.push(b.clone());
     }
-    doc.hf = Arc::new(hf_sections(&pkg.parts, &sects, pkg_id, &doc.styles, &doc.numbering));
-    doc.notes = Arc::new(notes_from_parts(&pkg.parts, pkg_id, &doc.styles, &doc.numbering));
+    doc.hf = Arc::new(hf_sections(&pkg.parts, &sects, &doc.styles, &doc.numbering));
+    doc.notes = Arc::new(notes_from_parts(&pkg.parts, &doc.styles, &doc.numbering));
     doc.comments = Arc::new(comments_from_parts(&pkg.parts));
     doc.pkg = Some(Arc::new(pkg));
     if !paras.is_empty() {
@@ -1475,6 +1478,8 @@ struct Writer<'a> {
     drop_markers: HashSet<(usize, usize)>,
     /// Existing rel ids, to avoid collisions.
     used_rel_ids: HashSet<String>,
+    /// Write floating pictures inline (notes).
+    inline_only: bool,
 }
 
 impl<'a> Writer<'a> {
@@ -1491,6 +1496,7 @@ impl<'a> Writer<'a> {
             doc_pr_id: 0,
             drop_markers: HashSet::new(),
             used_rel_ids,
+            inline_only: false,
         };
         w.balance_fields();
         w
@@ -1872,7 +1878,7 @@ impl<'a> Writer<'a> {
         let rel = self.image_rel(image);
         let cx = (w * 12700.0) as i64;
         let cy = (h * 12700.0) as i64;
-        if let Some((raw, pkg)) = raw {
+        if let Some((raw, pkg)) = raw.filter(|_| !(self.inline_only && img.anchor.is_some())) {
             if pkg == self.pkg_id || !raw.contains(" r:id=") {
                 if let Ok(mut el) = xml::parse(&raw) {
                     patch_drawing(&mut el, &rel, cx, cy);
@@ -2125,7 +2131,7 @@ fn section_xml(doc: &Document, original: Option<&str>, header: Option<&str>, foo
     el.to_xml()
 }
 
-fn content_types_new(has_header: bool, has_footer: bool) -> String {
+fn content_types_new(has_header: bool, has_footer: bool, extra: &[(String, &str)]) -> String {
     let mut ct = String::from(
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
 <Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">\
@@ -2147,6 +2153,9 @@ fn content_types_new(has_header: bool, has_footer: bool) -> String {
     }
     if has_footer {
         ct.push_str("<Override PartName=\"/word/footer_fw.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.footer+xml\"/>");
+    }
+    for (part, t) in extra {
+        ct.push_str(&format!("<Override PartName=\"{part}\" ContentType=\"{t}\"/>"));
     }
     ct.push_str("</Types>");
     ct
@@ -2201,14 +2210,13 @@ fn patch_rels(original: &str, rels: &[(String, String, String, bool)]) -> String
 /// `root_attrs` are the original root element's attributes (namespace declarations).
 fn hf_part_xml(
     sub: &Document,
-    pkg_id: u64,
     tag: &str,
     root_attrs: &[(String, String)],
     used: HashSet<String>,
 ) -> (String, Vec<(String, String, String, bool)>, Vec<(String, Arc<Vec<u8>>)>) {
     let mut sub = sub.clone();
     sub.ensure_trailing_para();
-    let mut w = Writer::new(&sub, pkg_id, used);
+    let mut w = Writer::new(&sub, sub.pkg_id(), used);
     let body = w.blocks_xml();
     let mut attrs: Vec<(String, String)> = root_attrs.to_vec();
     for (k, v) in [
@@ -2246,7 +2254,7 @@ pub fn edited_hf_parts(doc: &Document) -> Vec<(String, Vec<u8>)> {
         let used: HashSet<String> = xml::parse(&orig_rels)
             .map(|r| r.elems().filter_map(|e| e.attr("Id").map(|s| s.to_string())).collect())
             .unwrap_or_default();
-        let (xml, rels, media) = hf_part_xml(sub, pkg.id, tag, &orig.attrs, used);
+        let (xml, rels, media) = hf_part_xml(sub, tag, &orig.attrs, used);
         out.push((target.clone(), xml.into_bytes()));
         if !rels.is_empty() {
             out.push((rels_name, patch_rels(&orig_rels, &rels).into_bytes()));
@@ -2258,6 +2266,155 @@ pub fn edited_hf_parts(doc: &Document) -> Vec<(String, Vec<u8>)> {
         }));
     }
     out
+}
+
+const NS_EXTRA: [(&str, &str); 3] = [
+    ("xmlns:wp", "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"),
+    ("xmlns:a", "http://schemas.openxmlformats.org/drawingml/2006/main"),
+    ("xmlns:pic", "http://schemas.openxmlformats.org/drawingml/2006/picture"),
+];
+
+/// Body XML of a note, with the relationships and media it adds (ids avoid `used`).
+fn note_blocks(note: &Document, used: HashSet<String>) -> (String, Vec<(String, String, String, bool)>, Vec<(String, Arc<Vec<u8>>)>) {
+    let mut d = note.clone();
+    d.ensure_trailing_para();
+    let mut w = Writer::new(&d, d.pkg_id(), used);
+    // Word allows no floating objects in notes.
+    w.inline_only = true;
+    let blocks = w.blocks_xml();
+    (blocks, w.rels, w.media)
+}
+
+/// Rewritten (or new) footnotes/endnotes parts for every edited or created note.
+/// A missing part is created and related from the main document through `w`.
+/// Returns the parts and the content types of new parts.
+fn note_parts(doc: &Document, w: &mut Writer) -> (Vec<(String, Vec<u8>)>, Vec<(String, &'static str)>) {
+    let mut out = Vec::new();
+    let mut overrides = Vec::new();
+    let pkg = doc.pkg.as_deref();
+    let main_rels = pkg.map(|p| read_rels(&p.parts, "word/document.xml")).unwrap_or_default();
+    for (endnote, kind, tag) in [(false, "footnotes", "footnote"), (true, "endnotes", "endnote")] {
+        let edited: Vec<(&String, &Document)> =
+            doc.notes.iter().filter(|((e, _), d)| *e == endnote && d.edited).map(|((_, id), d)| (id, d)).collect();
+        if edited.is_empty() {
+            continue;
+        }
+        let existing = main_rels
+            .values()
+            .find(|r| r.kind == kind)
+            .and_then(|r| Some((r.target.clone(), part_xml(&pkg?.parts, &r.target)?)));
+        let (target, mut root) = match existing {
+            Some(x) => x,
+            None => {
+                let name = format!("{kind}_fw.xml");
+                w.new_rel(kind, &name, false);
+                let ct = if endnote {
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.endnotes+xml"
+                } else {
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.footnotes+xml"
+                };
+                overrides.push((format!("/word/{name}"), ct));
+                let mut attrs: Vec<(String, String)> = pkg.map(|p| p.root_attrs.clone()).unwrap_or_default();
+                for (k, v) in [("xmlns:w", W_NS), ("xmlns:r", R_NS)].into_iter().chain(NS_EXTRA) {
+                    if !attrs.iter().any(|(a, _)| a == k) {
+                        attrs.push((k.into(), v.into()));
+                    }
+                }
+                let attr_s: String = attrs.iter().map(|(k, v)| format!(" {k}=\"{}\"", esc(v))).collect();
+                let sp = "<w:pPr><w:spacing w:after=\"0\" w:line=\"240\" w:lineRule=\"auto\"/></w:pPr>";
+                let xml = format!(
+                    "<w:{kind}{attr_s}><w:{tag} w:type=\"separator\" w:id=\"-1\"><w:p>{sp}<w:r><w:separator/></w:r></w:p></w:{tag}>\
+<w:{tag} w:type=\"continuationSeparator\" w:id=\"0\"><w:p>{sp}<w:r><w:continuationSeparator/></w:r></w:p></w:{tag}></w:{kind}>"
+                );
+                (format!("word/{name}"), xml::parse(&xml).expect("notes part"))
+            }
+        };
+        let (dir, file) = target.rsplit_once('/').unwrap_or(("", &target));
+        let rels_name = if dir.is_empty() { format!("_rels/{file}.rels") } else { format!("{dir}/_rels/{file}.rels") };
+        let orig_rels = pkg.and_then(|p| p.parts.get(&rels_name)).map(|b| String::from_utf8_lossy(b).to_string()).unwrap_or_default();
+        let mut used: HashSet<String> = xml::parse(&orig_rels)
+            .map(|r| r.elems().filter_map(|e| e.attr("Id").map(|s| s.to_string())).collect())
+            .unwrap_or_default();
+        let mut rels = Vec::new();
+        let mut media = Vec::new();
+        for (id, note) in edited {
+            let (blocks, r, m) = note_blocks(note, used.clone());
+            used.extend(r.iter().map(|x| x.0.clone()));
+            rels.extend(r);
+            media.extend(m);
+            let ns: String = [("xmlns:w", W_NS), ("xmlns:r", R_NS)].iter().map(|(k, v)| format!(" {k}=\"{v}\"")).collect();
+            let Ok(frag) = xml::parse(&format!("<w:{tag}{ns}>{blocks}</w:{tag}>")) else { continue };
+            if let Some(e) = root.elems_mut().find(|e| e.name == tag && e.attr("id") == Some(id.as_str())) {
+                e.children = frag.children;
+            } else {
+                let mut e = El::new(&format!("w:{tag}"));
+                e.set_attr("w:id", id);
+                e.children = frag.children;
+                root.children.push(xml::Node::El(e));
+            }
+        }
+        let xml = format!("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n{}", root.to_xml());
+        out.push((target.clone(), xml.into_bytes()));
+        if !rels.is_empty() {
+            out.push((rels_name, patch_rels(&orig_rels, &rels).into_bytes()));
+        }
+        out.extend(media.into_iter().map(|(n, b)| {
+            let n = n.strip_prefix("word/").unwrap_or(&n);
+            (if dir.is_empty() { n.to_string() } else { format!("{dir}/{n}") }, b.to_vec())
+        }));
+    }
+    (out, overrides)
+}
+
+/// A new, empty footnote (or endnote) with its number mark, as Word creates it.
+pub fn new_note(doc: &Document, endnote: bool, id: &str) -> Document {
+    let (tag, text_style, ref_style) = if endnote {
+        ("endnote", "EndnoteText", "EndnoteReference")
+    } else {
+        ("footnote", "FootnoteText", "FootnoteReference")
+    };
+    let has = |s: &str| doc.styles.styles.contains_key(s);
+    let (ppr, size) = if has(text_style) {
+        (format!("<w:pPr><w:pStyle w:val=\"{text_style}\"/></w:pPr>"), "")
+    } else {
+        (
+            "<w:pPr><w:spacing w:after=\"0\" w:line=\"240\" w:lineRule=\"auto\"/><w:rPr><w:sz w:val=\"20\"/></w:rPr></w:pPr>".to_string(),
+            "<w:sz w:val=\"20\"/>",
+        )
+    };
+    let ref_rpr = if has(ref_style) {
+        format!("<w:rStyle w:val=\"{ref_style}\"/>{size}")
+    } else {
+        format!("{size}<w:vertAlign w:val=\"superscript\"/>")
+    };
+    let xml = format!(
+        "<w:{tag} w:id=\"{id}\"><w:p>{ppr}<w:r><w:rPr>{ref_rpr}</w:rPr><w:{tag}Ref/></w:r><w:r><w:rPr>{size}</w:rPr><w:t xml:space=\"preserve\"> </w:t></w:r></w:p></w:{tag}>"
+    );
+    note_from_xml(doc, endnote, id, &xml)
+}
+
+/// A note read back from its `w:footnote`/`w:endnote` XML (marked as edited).
+pub fn note_from_xml(doc: &Document, endnote: bool, id: &str, xml: &str) -> Document {
+    let target = format!("word/{}_fw.xml", if endnote { "endnotes" } else { "footnotes" });
+    let parts = BTreeMap::from([(target.clone(), xml.as_bytes().to_vec())]);
+    let base = 900_000_000 + (id.parse::<u32>().unwrap_or(0) % 5000) * 10_000 + if endnote { 5000 } else { 0 };
+    let mut d = hf_document(&parts, &target, pool::new_pkg_id(), &doc.styles, &doc.numbering, base).unwrap_or_else(Document::new);
+    d.source = None;
+    d.edited = true;
+    d
+}
+
+/// XML of every edited note: (endnote, id, `w:footnote`/`w:endnote` element).
+pub fn edited_notes_xml(doc: &Document) -> Vec<(bool, String, String)> {
+    doc.notes
+        .iter()
+        .filter(|(_, d)| d.edited)
+        .map(|((endnote, id), d)| {
+            let tag = if *endnote { "endnote" } else { "footnote" };
+            let (blocks, _, _) = note_blocks(d, HashSet::new());
+            (*endnote, id.clone(), format!("<w:{tag} xmlns:w=\"{W_NS}\" xmlns:r=\"{R_NS}\" w:id=\"{}\">{blocks}</w:{tag}>", esc(id)))
+        })
+        .collect()
 }
 
 pub fn save_docx(doc: &Document, path: &Path) -> Result<(), String> {
@@ -2305,12 +2462,13 @@ pub fn docx_bytes(doc: &Document) -> Result<Vec<u8>, String> {
         Some(p) => hf_changed(p),
         None => (!doc.header.is_empty(), !doc.footer.is_empty() || doc.page_numbers),
     };
+    let root_ns: Vec<(String, String)> = pkg.map(|p| p.root_attrs.clone()).unwrap_or_default();
     let mut hf_out: Vec<(String, Vec<u8>)> = Vec::new();
     let mut new_part = |rich: Option<&Document>, plain: bool, header: bool| -> bool {
         let (tag, name) = if header { ("hdr", "header_fw.xml") } else { ("ftr", "footer_fw.xml") };
         let xml = match rich {
             Some(d) => {
-                let (xml, rels, media) = hf_part_xml(d, doc.pkg_id(), tag, &[], HashSet::new());
+                let (xml, rels, media) = hf_part_xml(d, tag, &root_ns, HashSet::new());
                 if !rels.is_empty() {
                     hf_out.push((format!("word/_rels/{name}.rels"), patch_rels("", &rels).into_bytes()));
                 }
@@ -2328,6 +2486,8 @@ pub fn docx_bytes(doc: &Document) -> Result<Vec<u8>, String> {
     let new_header = new_part(rich_header, plain_header, true);
     let new_footer = new_part(rich_footer, plain_footer, false);
     hf_out.extend(edited_hf_parts(doc));
+    let (notes_out, notes_ct) = note_parts(doc, &mut w);
+    hf_out.extend(notes_out);
     let header_rel = new_header.then(|| w.new_rel("header", "header_fw.xml", false));
     let footer_rel = new_footer.then(|| w.new_rel("footer", "footer_fw.xml", false));
     let sect = section_xml(doc, pkg.and_then(|p| p.body_sect.as_deref()), header_rel.as_deref(), footer_rel.as_deref());
@@ -2380,6 +2540,7 @@ pub fn docx_bytes(doc: &Document) -> Result<Vec<u8>, String> {
             if new_footer {
                 overrides.push(("/word/footer_fw.xml", "application/vnd.openxmlformats-officedocument.wordprocessingml.footer+xml"));
             }
+            overrides.extend(notes_ct.iter().map(|(p, c)| (p.as_str(), *c)));
             let orig_rels = p.parts.get(orig_rels_name).map(|b| String::from_utf8_lossy(b).to_string()).unwrap_or_default();
             parts.insert(orig_rels_name.into(), patch_rels(&orig_rels, &w.rels).into_bytes());
             let ct = String::from_utf8_lossy(p.parts.get("[Content_Types].xml").map(|v| v.as_slice()).unwrap_or(b"")).to_string();
@@ -2412,7 +2573,7 @@ pub fn docx_bytes(doc: &Document) -> Result<Vec<u8>, String> {
                 )
                 .into_bytes(),
             );
-            parts.insert("[Content_Types].xml".into(), content_types_new(new_header, new_footer).into_bytes());
+            parts.insert("[Content_Types].xml".into(), content_types_new(new_header, new_footer, &notes_ct).into_bytes());
             let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
             parts.insert(
                 "docProps/core.xml".into(),

@@ -1,7 +1,7 @@
 //! The page canvas: keyboard and mouse handling, and painting.
 
 use crate::app::{App, After, Tab};
-use crate::story::StoryReq;
+use crate::story::{StoryReq, Target, Zone};
 use crate::doc::{Align, LINE_BREAK, ListKind, OBJ, PAGE_BREAK, Pos, Rgba, Style};
 use crate::layout::{self, Layout};
 use crate::render::{self, Canvas as _};
@@ -145,6 +145,8 @@ impl App {
                 let e = self.doc.end();
                 self.select(Pos::default(), e);
             }
+            Key::F if alt => self.insert_note(false),
+            Key::D if alt => self.insert_note(true),
             Key::B => self.toggle_bold(),
             Key::I => self.toggle_italic(),
             Key::U => self.toggle_underline(),
@@ -319,21 +321,26 @@ impl App {
         }
     }
 
-    /// Page under a screen point and whether it is in that page's header (Some(true)),
-    /// footer (Some(false)) or body area (None), judged from the body layout, plus the
-    /// page-relative point.
-    fn hf_zone(&self, rect: Rect, lay: &Layout, p: Pos2) -> (usize, Option<bool>, Pos2) {
+    /// Page under a screen point, the zone of that page it is in (judged from the
+    /// body layout), and the page-relative point.
+    fn zone_at(&self, rect: Rect, lay: &Layout, p: Pos2) -> (usize, Zone, Pos2) {
         let bl = self.main_layout().unwrap_or(lay);
         let rel = p.y - rect.top() - GAP;
         let page = ((rel / (bl.page_h + GAP)).floor().max(0.0) as usize).min(bl.pages - 1);
         let o = self.page_origin(rect, bl, page);
         let local = pos2(p.x - o.x, p.y - o.y);
-        let zone = if local.y < bl.margins[0] {
-            Some(true)
+        let note = bl.notes.iter().find(|n| {
+            let (t, b) = Layout::note_extent(n);
+            n.page == page && local.y >= t - 2.0 && local.y <= b + 2.0
+        });
+        let zone = if let Some(n) = note {
+            Zone::Note(n.key.clone())
+        } else if local.y < bl.margins[0] {
+            Zone::Header
         } else if local.y > bl.page_h - bl.margins[2] {
-            Some(false)
+            Zone::Footer
         } else {
-            None
+            Zone::Body
         };
         (page, zone, local)
     }
@@ -394,27 +401,36 @@ impl App {
                 let same_spot = time - self.last_click.0 < 0.45 && self.last_click.1.distance(p) < 6.0;
                 let count = if same_spot { self.last_click.2 + 1 } else { 1 };
                 self.last_click = (time, p, count);
-                // Headers and footers: double-click to open or leave them, like Word.
-                let (zpage, zone, local) = self.hf_zone(rect, lay, p);
+                // Headers and footers open and close with a double-click, like Word;
+                // notes with a single click.
+                let (zpage, zone, local) = self.zone_at(rect, lay, p);
                 let at = Some((local.x, local.y));
-                match (self.story.as_deref(), zone) {
-                    (None, Some(header)) if count == 2 => {
-                        self.story_req = Some(StoryReq::Open { page: zpage, header, at });
-                        return;
+                let at_page = Some((zpage, local.x, local.y));
+                let hf_req = |z: &Zone| StoryReq::Open { page: zpage, header: *z == Zone::Header, at };
+                let own = self.story.as_deref().map(|s| (s.zone(), s.page));
+                let req = match own {
+                    None => match &zone {
+                        Zone::Note(key) => Some(StoryReq::OpenNote { key: key.clone(), at: at_page }),
+                        Zone::Header | Zone::Footer if count == 2 => Some(hf_req(&zone)),
+                        _ => None,
+                    },
+                    // Inside the open story: ordinary editing.
+                    Some((z0, p0)) if zone == z0 && (zpage == p0 || matches!(z0, Zone::Note(_))) => None,
+                    Some((z0, _)) => {
+                        let note_open = matches!(z0, Zone::Note(_));
+                        Some(match &zone {
+                            Zone::Note(key) => StoryReq::OpenNote { key: key.clone(), at: at_page },
+                            Zone::Body if note_open => StoryReq::Close { at: at_page },
+                            Zone::Body if count == 2 => StoryReq::Close { at: None },
+                            // Another header/footer (or the same one on another page).
+                            Zone::Header | Zone::Footer if count == 2 || zone == z0 => hf_req(&zone),
+                            _ => return,
+                        })
                     }
-                    (Some(st), z) if z != Some(st.is_header()) || zpage != st.page => {
-                        if count == 2 {
-                            self.story_req = Some(match z {
-                                Some(header) => StoryReq::Open { page: zpage, header, at },
-                                None => StoryReq::Close,
-                            });
-                        } else if z == Some(st.is_header()) {
-                            // The same header on another page.
-                            self.story_req = Some(StoryReq::Open { page: zpage, header: st.is_header(), at });
-                        }
-                        return;
-                    }
-                    _ => {}
+                };
+                if req.is_some() {
+                    self.story_req = req;
+                    return;
                 }
                 let (page, pos) = self.hit_point(rect, lay, p);
                 self.goal_x = None;
@@ -670,22 +686,41 @@ impl App {
             let mut canvas = EguiCanvas { painter: &painter, origin: o, textures: &textures };
             if let Some((st, _)) = story {
                 render::draw_page(&mut canvas, pdoc, play, page, |_, _| {});
-                // Dim the body; mark the header (footer) area on pages showing it.
                 let veil = Color32::from_rgba_unmultiplied(255, 255, 255, 140);
-                let body = Rect::from_min_max(o + vec2(0.0, play.margins[0]), o + vec2(lay.page_w, lay.page_h - play.margins[2]));
-                painter.rect_filled(body, 0.0, veil);
-                if play.hf_slot(pdoc, st.is_header(), page) == (st.section, st.variant) {
-                    let y = if st.is_header() { play.margins[0] } else { lay.page_h - play.margins[2] };
+                // The band of the page showing the story stays bright; the rest is veiled.
+                let band = match &st.target {
+                    Target::Hf { section, variant } if play.hf_slot(pdoc, *variant < 2, page) == (*section, *variant) => {
+                        Some(if *variant < 2 { (0.0, play.margins[0]) } else { (lay.page_h - play.margins[2], lay.page_h) })
+                    }
+                    Target::Note(_) if page == st.page && !lay.lines.is_empty() => {
+                        let t = lay.lines.iter().map(|l| l.y).fold(f32::MAX, f32::min);
+                        let b = lay.lines.iter().map(|l| l.y + l.height).fold(0.0f32, f32::max);
+                        Some((t - 4.0, b + 4.0))
+                    }
+                    _ => None,
+                };
+                let (t, b) = band.unwrap_or((0.0, 0.0));
+                for (y0, y1) in [(0.0, t), (b, lay.page_h)] {
+                    if y1 > y0 {
+                        painter.rect_filled(Rect::from_min_max(o + vec2(0.0, y0), o + vec2(lay.page_w, y1)), 0.0, veil);
+                    }
+                }
+                if band.is_some() {
                     let blue = Color32::from_rgb(0x2B, 0x57, 0x9A);
-                    let mut x = 0.0;
-                    while x < lay.page_w {
-                        painter.line_segment([o + vec2(x, y), o + vec2((x + 4.0).min(lay.page_w), y)], Stroke::new(1.0, blue));
-                        x += 7.0;
+                    for y in [t, b] {
+                        if y <= 0.0 || y >= lay.page_h {
+                            continue;
+                        }
+                        let mut x = 0.0;
+                        while x < lay.page_w {
+                            painter.line_segment([o + vec2(x, y), o + vec2((x + 4.0).min(lay.page_w), y)], Stroke::new(1.0, blue));
+                            x += 7.0;
+                        }
                     }
                     let font = egui::FontId::proportional(11.0);
                     let galley = painter.layout_no_wrap(st.name(), font, Color32::WHITE);
                     let size = galley.size() + vec2(10.0, 4.0);
-                    let tag_y = if st.is_header() { y } else { y - size.y };
+                    let tag_y = if t <= 0.0 { b } else { t - size.y };
                     let tag = Rect::from_min_size(o + vec2(play.margins[3], tag_y), size);
                     painter.rect_filled(tag, 2.0, blue);
                     painter.galley(tag.min + vec2(5.0, 2.0), galley, Color32::WHITE);

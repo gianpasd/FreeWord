@@ -29,8 +29,9 @@ edits and saves real `.docx` files without losing their content.
 
 **Layout fidelity**
 - Headers and footers with tables and pictures, per section, first-page variants,
-  live page numbers
-- Footnotes at the bottom of the page, endnotes after the text
+  live page numbers; edited in place (double-click the top or bottom of a page)
+- Footnotes at the bottom of the page, endnotes after the text; click a note to
+  edit it, Ctrl+Alt+F / Ctrl+Alt+D inserts a footnote / endnote
 - Sections with page/continuous breaks and multiple (balanced) columns
 - Floating pictures and shapes positioned relative to page, margin, column,
   paragraph or line
@@ -82,6 +83,6 @@ automation and Poppler for rendering):
 
 ## Not yet implemented
 
-Editing inside headers/footers, footnotes and nested tables; text-box contents;
+Editing inside nested tables; text-box contents;
 right-to-left and complex scripts; hyphenation; table header rows repeating on
 new pages; per-change accept/reject; adding new comments.

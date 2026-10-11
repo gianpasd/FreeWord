@@ -209,12 +209,26 @@ impl Layout {
         (section, if header { 0 } else { 2 } + first as usize)
     }
 
-    /// Layout of a header/footer placed on `page` of this (body) layout, for editing it in place:
-    /// its lines are moved onto `page` and every other page is empty.
+    /// Layout of a header/footer placed on `page` of this (body) layout, for editing it in place.
     pub fn story_layout(&self, section: usize, variant: usize, page: usize) -> Option<Layout> {
         let b = self.hf.iter().find(|b| b.section == section && b.variant == variant)?;
-        let mut l = (*b.lay).clone();
-        let dy = b.dy;
+        Some(self.placed(&b.lay, page, b.dy))
+    }
+
+    /// Layout of a footnote/endnote where it is shown, with its page.
+    pub fn note_story_layout(&self, key: &(bool, String)) -> Option<(Layout, usize)> {
+        let n = self.notes.iter().find(|n| &n.key == key)?;
+        Some((self.placed(&n.lay, n.page, n.y), n.page))
+    }
+
+    /// Vertical extent of a footnote/endnote on its page.
+    pub fn note_extent(n: &NoteBox) -> (f32, f32) {
+        (n.y, n.y + content_height(&n.lay))
+    }
+
+    /// A sub-layout (header, note) moved onto `page` at offset `dy`; every other page is empty.
+    fn placed(&self, sub: &Layout, page: usize, dy: f32) -> Layout {
+        let mut l = sub.clone();
         for line in &mut l.lines {
             line.page = page;
             line.y += dy;
@@ -241,7 +255,7 @@ impl Layout {
         l.notes.clear();
         l.note_separators.clear();
         l.hf.clear();
-        Some(l)
+        l
     }
 }
 

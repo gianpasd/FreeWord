@@ -4,13 +4,21 @@ Updated at the end of every work session. Newest session notes at the bottom.
 
 ## Next up
 
-- [ ] Editing inside headers/footers (double-click to edit, like Word)
-- [ ] Editing inside footnotes/endnotes; Insert Footnote / Insert Endnote
 - [ ] Editing inside nested tables
 - [ ] Text-box contents rendered (wps:txbx) instead of a placeholder box
 - [ ] Repeat table header rows (`w:tblHeader`) on each new page; split long rows across pages (`cantSplit`)
 - [ ] Per-change Accept / Reject (next/previous change navigation)
 - [ ] New comments: insert, reply, delete, resolve (write `comments.xml`)
+- [ ] Headers/footers: create one for a section other than the last, or a first-page /
+  even-page variant (currently only the last section's default header can be created)
+- [ ] Notes: deleting a reference leaves its note in `footnotes.xml` (harmless, but
+  should be removed); note numbering formats (`w:numFmt`) and restart rules
+- [ ] `.fwd` files: hyperlinks/pictures added to edited notes or new headers lose their
+  relationships when reopened (the .docx path is fine)
+- [ ] Notes UI: clicking into a footnote/endnote and the note band highlight were only
+  covered by unit tests, not tried interactively yet
+- [ ] Pasting objects with relationships (charts, SmartArt) between body, headers and
+  notes drops them; copy their target parts instead
 
 ## .docx fidelity
 
@@ -56,6 +64,11 @@ Updated at the end of every work session. Newest session notes at the bottom.
 
 ## Done
 
+- [x] Edit headers/footers in place (double-click, Esc to leave; Insert > Header/Footer;
+  PAGE/NUMPAGES fields); new headers for documents without one
+- [x] Edit footnotes/endnotes in place (click a note); Insert Footnote/Endnote
+  (Ctrl+Alt+F / Ctrl+Alt+D); notes parts rewritten or created on save
+
 - [x] Word-style ribbon, paginated WYSIWYG editing, formatting, lists, styles, pictures
 - [x] PDF export with embedded subset fonts; HTML/TXT export
 - [x] Lossless .docx round-trips (package parts, unknown XML, fields, bookmarks, revisions...)
@@ -77,3 +90,12 @@ Updated at the end of every work session. Newest session notes at the bottom.
   pagination rules; nested tables; tracked changes & comments; stress testing.
   All 10 corpus documents round-trip pixel-identically; 80 stress runs × 400
   edits open cleanly in Word.
+- **2026-10-11** – Header/footer editing in place (story mode: double-click, Esc,
+  contextual ribbon group, PAGE/NUMPAGES fields, new headers for docs without
+  one); footnote/endnote editing and Insert Footnote/Endnote; edited parts
+  rewritten on save, each header/notes part scoped for raw XML so pasted charts
+  can't point at the wrong relationships; duplicate note references dropped on
+  save. `validate_word.ps1` now uses one Word instance per file with a timeout
+  (reports HANG). Tests: `cargo test` 7/7; corpus round-trip and visual compare
+  unchanged (10/10 identical); 80 stress runs × 400 edits (now incl. header and
+  note edits) + 24 header/note outputs all open in Word.

@@ -80,7 +80,7 @@ pub fn run(input: &Path, output: &Path, seed: u64, steps: usize) -> Result<(), S
         } else {
             app.set_cursor(a, false);
         }
-        let op = r.below(44);
+        let op = r.below(47);
         let name = format!("op{op}");
         match op {
             0..=5 => app.insert_typed(WORDS[r.below(WORDS.len())]),
@@ -153,6 +153,17 @@ pub fn run(input: &Path, output: &Path, seed: u64, steps: usize) -> Result<(), S
                 app.open_hf(r.below(pages), op == 40, None);
             }
             42 => app.close_story(),
+            44 => {
+                if r.chance(30) {
+                    app.insert_note(r.chance(30));
+                }
+            }
+            45 => {
+                let keys: Vec<(bool, String)> = app.main_doc().notes.keys().cloned().collect();
+                if !keys.is_empty() {
+                    app.open_note(keys[r.below(keys.len())].clone(), None);
+                }
+            }
             _ => {
                 if app.story.is_some() {
                     app.insert_page_field(r.chance(50));

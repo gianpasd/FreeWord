@@ -77,6 +77,9 @@ struct FileDoc {
     /// Headers (true) / footers (false) created in FreeWord, as part XML.
     #[serde(default)]
     new_hf: Vec<(bool, String)>,
+    /// Footnotes/endnotes edited or created in FreeWord: (endnote, id, XML).
+    #[serde(default)]
+    notes: Vec<(bool, String, String)>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -298,6 +301,7 @@ pub fn save_native(doc: &Document, path: &Path) -> Result<(), String> {
         numbering: Some(doc.numbering.clone()),
         package,
         new_hf: crate::docx::new_hf_xml(doc),
+        notes: crate::docx::edited_notes_xml(doc),
         paras: doc
             .paras
             .iter()
@@ -362,7 +366,7 @@ pub fn load_native(path: &Path) -> Result<Document, String> {
         None => doc.numbering = Numbering::new_default(),
     }
     if let Some(pkg) = doc.pkg.clone() {
-        doc.notes = Arc::new(crate::docx::notes_from_parts(&pkg.parts, pkg.id, &doc.styles, &doc.numbering));
+        doc.notes = Arc::new(crate::docx::notes_from_parts(&pkg.parts, &doc.styles, &doc.numbering));
         doc.comments = Arc::new(crate::docx::comments_from_parts(&pkg.parts));
     }
     for im in fd.images {
@@ -435,7 +439,7 @@ pub fn load_native(path: &Path) -> Result<Document, String> {
         doc.paras.push(Para::new(Style::Normal));
     }
     if let Some(pkg) = doc.pkg.clone() {
-        doc.hf = Arc::new(crate::docx::hf_sections(&pkg.parts, &doc.section_props(), pkg.id, &doc.styles, &doc.numbering));
+        doc.hf = Arc::new(crate::docx::hf_sections(&pkg.parts, &doc.section_props(), &doc.styles, &doc.numbering));
         // Plain text set in FreeWord replaces the package's headers/footers.
         if doc.header != pkg.header_text {
             doc.clear_rich_hf(true);
@@ -443,6 +447,10 @@ pub fn load_native(path: &Path) -> Result<Document, String> {
         if doc.footer != pkg.footer_text || doc.page_numbers != pkg.page_numbers {
             doc.clear_rich_hf(false);
         }
+    }
+    for (endnote, id, xml) in &fd.notes {
+        let note = crate::docx::note_from_xml(&doc, *endnote, id, xml);
+        Arc::make_mut(&mut doc.notes).insert((*endnote, id.clone()), note);
     }
     for (header, xml) in &fd.new_hf {
         let sub = crate::docx::hf_from_xml(&doc, *header, xml);
