@@ -591,6 +591,17 @@ impl Para {
     }
 }
 
+/// The `w:sectPr` element inside raw pPr XML, if any.
+pub fn extract_sect_pr(raw: &str) -> Option<String> {
+    let s = raw.find("<w:sectPr")?;
+    if let Some(e) = raw[s..].find("</w:sectPr>") {
+        return Some(raw[s..s + e + "</w:sectPr>".len()].to_string());
+    }
+    // Self-closing form.
+    let e = raw[s..].find("/>")?;
+    Some(raw[s..s + e + 2].to_string())
+}
+
 /// Removes a `w:sectPr` element from raw pPr XML.
 pub fn strip_sect_pr(raw: &str) -> String {
     if let (Some(s), Some(e)) = (raw.find("<w:sectPr"), raw.rfind("</w:sectPr>")) {
@@ -689,7 +700,8 @@ pub struct HeaderFooter {
 #[derive(Clone, Debug)]
 pub struct Document {
     pub paras: Vec<Para>,
-    pub hf: Arc<HeaderFooter>,
+    /// Rich headers/footers for each section (in document order; the last is the body section).
+    pub hf: Arc<Vec<HeaderFooter>>,
     /// Footnote (false) and endnote (true) texts by w:id.
     pub notes: Arc<BTreeMap<(bool, String), Document>>,
     pub page: PageSetup,
@@ -724,7 +736,7 @@ impl Document {
     pub fn new() -> Self {
         Document {
             paras: vec![Para::new(Style::Normal)],
-            hf: Arc::new(HeaderFooter::default()),
+            hf: Arc::new(Vec::new()),
             notes: Arc::new(BTreeMap::new()),
             page: PageSetup::default(),
             header: String::new(),
@@ -738,10 +750,29 @@ impl Document {
         }
     }
 
+    /// Every header/footer and note document.
+    pub fn hf_docs(&self) -> impl Iterator<Item = &Document> {
+        self.hf
+            .iter()
+            .flat_map(|h| [&h.header, &h.header_first, &h.footer, &h.footer_first])
+            .flatten()
+            .map(|b| b.as_ref())
+            .chain(self.notes.values())
+    }
+
+    /// Raw `w:sectPr` of every section in order (paragraph-level ones, then the body's).
+    pub fn section_props(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.paras.iter().filter(|p| p.sect_break).filter_map(|p| extract_sect_pr(&p.ppr_extra)).collect();
+        if let Some(b) = self.pkg.as_ref().and_then(|p| p.body_sect.clone()) {
+            v.push(b);
+        }
+        v
+    }
+
     /// All image stores (body plus header/footer documents).
     pub fn all_images(&self) -> Vec<(u32, &ImageData)> {
         let mut v: Vec<(u32, &ImageData)> = self.images.iter().map(|(k, v)| (*k, v)).collect();
-        for d in [&self.hf.header, &self.hf.header_first, &self.hf.footer, &self.hf.footer_first].into_iter().flatten() {
+        for d in self.hf_docs() {
             v.extend(d.images.iter().map(|(k, v)| (*k, v)));
         }
         v

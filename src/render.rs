@@ -85,16 +85,26 @@ pub fn draw_page<C: Canvas>(c: &mut C, doc: &Document, lay: &Layout, page: usize
     let pages = lay.pages;
     draw_content(c, doc, lay, page, (page + 1, pages), under);
     let sc = lay.scale;
-    let subs = [&doc.hf.header, &doc.hf.header_first, &doc.hf.footer, &doc.hf.footer_first];
+    // Footnotes and endnotes.
+    for (p, y) in &lay.note_separators {
+        if *p == page {
+            let x = lay.margins[3];
+            c.line(x, *y, x + 144.0 * sc, *y, (0.5 * sc).max(0.75), [0, 0, 0, 255]);
+        }
+    }
+    for n in lay.notes.iter().filter(|n| n.page == page) {
+        if let Some(d) = doc.notes.get(&n.key) {
+            let mut oc = Offset { inner: &mut *c, dy: n.y };
+            draw_content(&mut oc, d, &n.lay, 0, (page + 1, pages), |_, _| {});
+        }
+    }
     for header in [true, false] {
         let rich = if header { lay.rich_header } else { lay.rich_footer };
         if rich {
-            if let Some(i) = layout::hf_variant(doc, header, page) {
-                if let (Some(l), Some(d)) = (&lay.hf[i], subs[i]) {
-                    let mut oc = Offset { inner: &mut *c, dy: lay.hf_dy[i] };
-                    for p in 0..l.pages {
-                        draw_content(&mut oc, d, l, p, (page + 1, pages), |_, _| {});
-                    }
+            if let Some((b, d)) = lay.hf_for(doc, header, page) {
+                let mut oc = Offset { inner: &mut *c, dy: b.dy };
+                for p in 0..b.lay.pages {
+                    draw_content(&mut oc, d, &b.lay, p, (page + 1, pages), |_, _| {});
                 }
             }
             continue;

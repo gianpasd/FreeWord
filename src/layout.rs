@@ -72,28 +72,59 @@ pub struct Layout {
     pub header: (String, f32),
     /// Footer text and width for each page.
     pub footers: Vec<(String, f32)>,
-    /// Rich header/footer layouts: header, first-page header, footer, first-page footer.
-    pub hf: [Option<Box<Layout>>; 4],
-    /// Vertical offset at which each rich header/footer layout is drawn.
-    pub hf_dy: [f32; 4],
+    /// Rich header/footer layouts per (section, variant).
+    pub hf: Vec<HfBox>,
+    /// Section index of each page (the section in effect at the top of the page).
+    pub page_section: Vec<usize>,
+    /// First page of each section.
+    pub section_first_page: Vec<usize>,
     /// Whether rich (laid out) headers / footers are used instead of plain text.
     pub rich_header: bool,
     pub rich_footer: bool,
     /// PAGE / NUMPAGES field results: (paragraph, start, end, is NUMPAGES).
     pub page_fields: Vec<(usize, usize, usize, bool)>,
+    /// Footnotes (bottom of their page) and endnotes (after the text).
+    pub notes: Vec<NoteBox>,
+    /// Note separator lines: (page, y).
+    pub note_separators: Vec<(usize, f32)>,
 }
 
-/// Which rich header/footer variant (index into `Layout::hf`) applies to a page.
-pub fn hf_variant(doc: &Document, header: bool, page: usize) -> Option<usize> {
-    let (default, first, base) = if header {
-        (&doc.hf.header, &doc.hf.header_first, 0)
-    } else {
-        (&doc.hf.footer, &doc.hf.footer_first, 2)
-    };
-    if page == 0 && doc.hf.title_page {
-        return first.is_some().then_some(base + 1);
+type BTreeMapPages = std::collections::BTreeMap<usize, Vec<((bool, String), Box<Layout>, f32)>>;
+
+/// A laid-out header or footer. Variants: 0 header, 1 first-page header, 2 footer, 3 first-page footer.
+pub struct HfBox {
+    pub section: usize,
+    pub variant: usize,
+    pub lay: Box<Layout>,
+    pub dy: f32,
+}
+
+/// The document of a header/footer variant of a section.
+pub fn hf_doc(doc: &Document, section: usize, variant: usize) -> Option<&Document> {
+    let h = doc.hf.get(section)?;
+    match variant {
+        0 => h.header.as_deref(),
+        1 => h.header_first.as_deref(),
+        2 => h.footer.as_deref(),
+        _ => h.footer_first.as_deref(),
     }
-    default.is_some().then_some(base)
+}
+
+impl Layout {
+    /// The rich header (or footer) to draw on `page`, with its document.
+    pub fn hf_for<'a>(&'a self, doc: &'a Document, header: bool, page: usize) -> Option<(&'a HfBox, &'a Document)> {
+        let section = *self.page_section.get(page)?;
+        let first = self.section_first_page.get(section) == Some(&page) && doc.hf.get(section)?.title_page;
+        let variant = match (header, first) {
+            (true, false) => 0,
+            (true, true) => 1,
+            (false, false) => 2,
+            (false, true) => 3,
+        };
+        let d = hf_doc(doc, section, variant)?;
+        let b = self.hf.iter().find(|b| b.section == section && b.variant == variant)?;
+        Some((b, d))
+    }
 }
 
 /// Finds the results of PAGE and NUMPAGES fields.
@@ -148,6 +179,7 @@ fn hf_layout(main: &Document, sub: &Document, fonts: &mut FontsView<'_>, zoom: f
     d.footer.clear();
     d.page_numbers = false;
     d.hf = Default::default();
+    d.notes = Default::default();
     Box::new(layout(&d, fonts, zoom))
 }
 
@@ -300,8 +332,11 @@ impl Ctx<'_, '_> {
                             asc[i] = h * sc;
                             is_img[i] = true;
                         }
-                        ObjKind::NoteRef { endnote, .. } => {
-                            let label = if *endnote {
+                        ObjKind::NoteRef { endnote, id } => {
+                            let self_label = if id == "self" { NOTE_SELF.with(|s| s.borrow().clone()) } else { None };
+                            let label = if let Some(l) = self_label {
+                                l
+                            } else if *endnote {
                                 self.endnotes += 1;
                                 roman(self.endnotes)
                             } else {
@@ -576,8 +611,10 @@ fn roman(mut n: u32) -> String {
 }
 
 /// Whether a section break of this paragraph starts a new page.
-fn section_breaks_page(p: &doc::Para) -> bool {
-    p.sect_break && !p.ppr_extra.contains("w:val=\"continuous\"")
+/// Whether the section starting after break number `n` begins on a new page.
+/// The break type lives in the *following* section's `w:sectPr`.
+fn section_breaks_page(sects: &[String], n: usize) -> bool {
+    !sects.get(n + 1).is_some_and(|s| s.contains("w:type w:val=\"continuous\""))
 }
 
 struct Pager {
@@ -586,19 +623,175 @@ struct Pager {
     content_h: f32,
     mt: f32,
     force: bool,
+    /// Height reserved for footnotes at the bottom of the current page.
+    notes_h: f32,
+    /// Number of text columns and the current one.
+    cols: usize,
+    col: usize,
+    /// Where the current set of columns starts on this page.
+    col_top: f32,
+    /// Lowest point reached on the page (across columns).
+    max_y: f32,
+    /// Move to the next column (column break).
+    force_col: bool,
 }
 
 impl Pager {
     fn place(&mut self, h: f32) -> (usize, f32) {
-        if self.force || (self.y + h > self.content_h && self.y > 0.0) {
-            self.page += 1;
-            self.y = 0.0;
-            self.force = false;
+        self.place_with(h, 0.0)
+    }
+
+    fn new_page(&mut self) {
+        self.page += 1;
+        self.y = 0.0;
+        self.notes_h = 0.0;
+        self.col = 0;
+        self.col_top = 0.0;
+        self.max_y = 0.0;
+        self.force = false;
+        self.force_col = false;
+    }
+
+    /// Places a block of height `h` that brings `notes` of footnote height with it.
+    fn place_with(&mut self, h: f32, notes: f32) -> (usize, f32) {
+        let full = self.y + h + self.notes_h + notes > self.content_h && self.y > self.col_top;
+        if self.force {
+            self.new_page();
+        } else if full || self.force_col {
+            self.force_col = false;
+            if self.col + 1 < self.cols {
+                self.col += 1;
+                self.y = self.col_top;
+            } else {
+                self.new_page();
+            }
         }
         let at = (self.page, self.mt + self.y);
         self.y += h;
+        self.max_y = self.max_y.max(self.y);
+        self.notes_h += notes;
         at
     }
+
+    /// Starts a new set of columns below everything on the current page.
+    fn set_columns(&mut self, cols: usize) {
+        if cols != self.cols || self.col > 0 {
+            self.y = self.max_y.max(self.y);
+            self.col_top = self.y;
+            self.col = 0;
+        }
+        self.cols = cols.max(1);
+    }
+}
+
+/// Rebalances the lines of a multi-column section on its last page so the
+/// columns end at about the same height (Word does this before a continuous
+/// section break). Returns the new bottom y.
+#[allow(clippy::too_many_arguments)]
+fn balance_columns(
+    lines: &mut [Line],
+    line_cols: &mut [usize],
+    boxes: &mut [Option<ParaBox>],
+    from: usize,
+    ncols: usize,
+    col_w: f32,
+    gap: f32,
+    page: usize,
+) -> Option<f32> {
+    let idx: Vec<usize> = (from..lines.len()).filter(|i| lines[*i].page == page).collect();
+    if ncols < 2 || idx.len() < 2 {
+        return None;
+    }
+    let top = idx.iter().map(|i| lines[*i].y).fold(f32::MAX, f32::min);
+    // Vertical advance of each line within its original column (keeps paragraph spacing).
+    let adv: Vec<f32> = idx
+        .iter()
+        .enumerate()
+        .map(|(k, &i)| match idx.get(k + 1) {
+            Some(&n) if line_cols[n] == line_cols[i] && lines[n].y > lines[i].y => lines[n].y - lines[i].y,
+            _ => lines[i].height,
+        })
+        .collect();
+    let total: f32 = adv.iter().sum();
+    let target = total / ncols as f32;
+    let old_cols: Vec<usize> = idx.iter().map(|i| line_cols[*i]).collect();
+    let mut col = 0;
+    let mut acc = 0.0;
+    let mut bottom = top;
+    for (k, &i) in idx.iter().enumerate() {
+        if acc > 0.0 && acc + adv[k] / 2.0 > target && col + 1 < ncols {
+            col += 1;
+            acc = 0.0;
+        }
+        let dx = (col as f32 - old_cols[k] as f32) * (col_w + gap);
+        for x in &mut lines[i].xs {
+            *x += dx;
+        }
+        lines[i].y = top + acc;
+        line_cols[i] = col;
+        acc += adv[k];
+        bottom = bottom.max(lines[i].y + lines[i].height);
+    }
+    // Paragraph boxes follow their first line.
+    for b in boxes.iter_mut().flatten() {
+        if let Some(&first) = idx.iter().find(|i| b.lines.start == **i) {
+            let k = idx.iter().position(|i| *i == first).unwrap();
+            let dx = (line_cols[first] as f32 - old_cols[k] as f32) * (col_w + gap);
+            b.left += dx;
+            b.right += dx;
+            if let Some(m) = &mut b.marker {
+                m.1 += dx;
+            }
+        }
+    }
+    Some(bottom)
+}
+
+/// (column count, gap in points) of a section's `w:cols`.
+fn section_columns(sect: Option<&String>) -> (usize, f32) {
+    let Some(el) = sect.and_then(|s| crate::xml::parse(s).ok()) else { return (1, 36.0) };
+    let Some(cols) = el.child("cols") else { return (1, 36.0) };
+    let explicit = cols.elems().filter(|c| c.name == "col").count();
+    let num = cols.attr("num").and_then(|v| v.parse::<usize>().ok()).unwrap_or(explicit.max(1));
+    let space = cols.attr("space").and_then(|v| v.parse::<f32>().ok()).map(|v| v / 20.0).unwrap_or(36.0);
+    (num.clamp(1, 12), space)
+}
+
+thread_local! {
+    /// Number shown by a note's own `footnoteRef` while laying out its text.
+    static NOTE_SELF: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// A laid-out footnote or endnote.
+pub struct NoteBox {
+    pub page: usize,
+    pub y: f32,
+    pub key: (bool, String),
+    pub lay: Box<Layout>,
+}
+
+/// Lays out a note's text across the body width, numbered `label`.
+fn note_layout(main: &Document, note: &Document, fonts: &mut FontsView<'_>, zoom: f32, label: &str) -> Box<Layout> {
+    NOTE_SELF.with(|s| *s.borrow_mut() = Some(label.to_string()));
+    let l = hf_layout(main, note, fonts, zoom, 0.0);
+    NOTE_SELF.with(|s| *s.borrow_mut() = None);
+    l
+}
+
+/// Footnote references (offset, label, id) on a line.
+fn line_note_refs(doc: &Document, obj_text: &HashMap<(usize, usize), String>, pi: usize, l: &Line, endnote: bool) -> Vec<(String, String)> {
+    let para = &doc.paras[pi];
+    (l.start..l.end)
+        .filter_map(|k| {
+            let o = pool::obj(para.fmts[k].obj)?;
+            match o.kind {
+                ObjKind::NoteRef { endnote: e, id } if e == endnote && id != "self" => {
+                    Some((obj_text.get(&(pi, k)).cloned().unwrap_or_default(), id))
+                }
+                _ => None,
+            }
+        })
+        .collect()
 }
 
 pub fn layout(doc: &Document, fonts: &mut FontsView<'_>, zoom: f32) -> Layout {
@@ -608,30 +801,29 @@ pub fn layout(doc: &Document, fonts: &mut FontsView<'_>, zoom: f32) -> Layout {
     let [mut mt, mr, mut mb, ml] = doc.page.margins.map(|m| m * sc);
 
     // Rich headers and footers; the body moves down/up if they don't fit in the margins.
-    let rich_header = doc.pkg.as_ref().is_some_and(|p| p.header_text == doc.header)
-        && (doc.hf.header.is_some() || doc.hf.header_first.is_some());
-    let rich_footer = doc.pkg.as_ref().is_some_and(|p| p.footer_text == doc.footer && p.page_numbers == doc.page_numbers)
-        && (doc.hf.footer.is_some() || doc.hf.footer_first.is_some());
-    let mut hf: [Option<Box<Layout>>; 4] = [None, None, None, None];
-    let mut hf_dy = [0.0f32; 4];
-    let subs = [&doc.hf.header, &doc.hf.header_first, &doc.hf.footer, &doc.hf.footer_first];
-    for (i, sub) in subs.into_iter().enumerate() {
-        let is_header = i < 2;
-        if (is_header && !rich_header) || (!is_header && !rich_footer) {
-            continue;
-        }
-        let Some(sub) = sub else { continue };
-        if is_header {
-            let l = hf_layout(doc, sub, fonts, zoom, doc.page.header_dist);
-            let bottom = doc.page.header_dist * sc + content_height(&l);
-            mt = mt.max(bottom + 4.0 * sc);
-            hf[i] = Some(l);
-        } else {
-            let l = hf_layout(doc, sub, fonts, zoom, 0.0);
-            let h = content_height(&l);
-            hf_dy[i] = ph - doc.page.footer_dist * sc - h;
-            mb = mb.max(doc.page.footer_dist * sc + h + 4.0 * sc);
-            hf[i] = Some(l);
+    let any = |v: [usize; 2]| (0..doc.hf.len()).any(|s| v.iter().any(|x| hf_doc(doc, s, *x).is_some()));
+    let rich_header = doc.pkg.as_ref().is_some_and(|p| p.header_text == doc.header) && any([0, 1]);
+    let rich_footer =
+        doc.pkg.as_ref().is_some_and(|p| p.footer_text == doc.footer && p.page_numbers == doc.page_numbers) && any([2, 3]);
+    let mut hf: Vec<HfBox> = Vec::new();
+    for section in 0..doc.hf.len() {
+        for variant in 0..4 {
+            let is_header = variant < 2;
+            if (is_header && !rich_header) || (!is_header && !rich_footer) {
+                continue;
+            }
+            let Some(sub) = hf_doc(doc, section, variant) else { continue };
+            if is_header {
+                let l = hf_layout(doc, sub, fonts, zoom, doc.page.header_dist);
+                let bottom = doc.page.header_dist * sc + content_height(&l);
+                mt = mt.max(bottom + 4.0 * sc);
+                hf.push(HfBox { section, variant, lay: l, dy: 0.0 });
+            } else {
+                let l = hf_layout(doc, sub, fonts, zoom, 0.0);
+                let h = content_height(&l);
+                mb = mb.max(doc.page.footer_dist * sc + h + 4.0 * sc);
+                hf.push(HfBox { section, variant, lay: l, dy: ph - doc.page.footer_dist * sc - h });
+            }
         }
     }
 
@@ -645,11 +837,32 @@ pub fn layout(doc: &Document, fonts: &mut FontsView<'_>, zoom: f32) -> Layout {
         footnotes: 0,
         endnotes: 0,
     };
-    let mut pager = Pager { page: 0, y: 0.0, content_h: (ph - mt - mb).max(20.0), mt, force: false };
+    let mut pager = Pager {
+        page: 0,
+        y: 0.0,
+        content_h: (ph - mt - mb).max(20.0),
+        mt,
+        force: false,
+        notes_h: 0.0,
+        cols: 1,
+        col: 0,
+        col_top: 0.0,
+        max_y: 0.0,
+        force_col: false,
+    };
+    // Footnotes per page: (page, key, layout, height).
+    let mut page_notes: Vec<(usize, (bool, String), Box<Layout>, f32)> = Vec::new();
     let mut lines: Vec<Line> = Vec::new();
     let mut boxes: Vec<Option<ParaBox>> = (0..doc.paras.len()).map(|_| None).collect();
     let mut cells: Vec<CellBox> = Vec::new();
     let mut pending_after = 0.0f32;
+    // Index of the first line of each section after the first.
+    let mut section_starts: Vec<usize> = Vec::new();
+    let sects = doc.section_props();
+    // Column of each line, and the first line of the current section.
+    let mut line_cols: Vec<usize> = Vec::new();
+    let mut section_first_line = 0usize;
+    let has_endnotes = doc.notes.keys().any(|(e, _)| *e);
     let mut prev_style: Option<(Option<String>, bool)> = None;
 
     let mut pi = 0;
@@ -795,29 +1008,145 @@ pub fn layout(doc: &Document, fonts: &mut FontsView<'_>, zoom: f32) -> Layout {
         if pager.y > 0.0 && !pager.force && !(same_style && para.contextual) {
             pager.y += para.space_before * sc;
         }
-        let pl = ctx.para(doc, pi, labels[pi].as_ref(), ml, pw - mr);
+        let (ncols, gap) = section_columns(sects.get(section_starts.len()));
+        if ncols != pager.cols {
+            pager.set_columns(ncols);
+        }
+        let col_w = ((pw - ml - mr) - gap * sc * (ncols as f32 - 1.0)) / ncols as f32;
+        let pl = ctx.para(doc, pi, labels[pi].as_ref(), ml, ml + col_w);
         let first_line = lines.len();
+        let mut first_shift = None;
         for mut l in pl.lines {
-            let (page, y) = pager.place(l.height);
+            // Footnotes referenced on this line must fit on the same page.
+            let mut new_notes = Vec::new();
+            let mut notes_h = 0.0;
+            if !doc.notes.is_empty() {
+                for (label, id) in line_note_refs(doc, &ctx.obj_text, pi, &l, false) {
+                    if let Some(nd) = doc.notes.get(&(false, id.clone())) {
+                        let nl = note_layout(doc, nd, ctx.fonts, zoom, &label);
+                        let h = content_height(&nl);
+                        notes_h += h;
+                        new_notes.push(((false, id), nl, h));
+                    }
+                }
+            }
+            let separator = if !new_notes.is_empty() { 14.0 * sc } else { 0.0 };
+            let (page, y) = pager.place_with(l.height, notes_h + if pager.notes_h == 0.0 { separator } else { 0.0 });
+            for (key, nl, h) in new_notes {
+                page_notes.push((page, key, nl, h));
+            }
             l.page = page;
             l.y = y;
-            let page_break = l.forced && doc.paras[pi].chars.get(l.end.wrapping_sub(1)) == Some(&PAGE_BREAK);
+            // Shift lines into their column.
+            let shift = pager.col as f32 * (col_w + gap * sc);
+            if shift != 0.0 {
+                for x in &mut l.xs {
+                    *x += shift;
+                }
+            }
+            first_shift.get_or_insert(shift);
+            line_cols.resize(lines.len(), 0);
+            line_cols.push(pager.col);
+            let last = doc.paras[pi].chars.get(l.end.wrapping_sub(1)).copied();
+            let page_break = l.forced && last == Some(PAGE_BREAK);
+            let column_break = l.forced && last == Some(COLUMN_BREAK);
             lines.push(l);
             if page_break {
                 pager.force = true;
             }
+            if column_break {
+                pager.force_col = true;
+            }
         }
-        boxes[pi] = Some(ParaBox { lines: first_line..lines.len(), left: pl.left, right: pl.right, marker: pl.marker });
+        let shift = first_shift.unwrap_or(0.0);
+        let marker = pl.marker.map(|(t, x)| (t, x + shift));
+        boxes[pi] = Some(ParaBox { lines: first_line..lines.len(), left: pl.left + shift, right: pl.right + shift, marker });
         pending_after = para.space_after * sc;
         prev_style = Some((para.style_id.clone(), para.contextual));
-        if section_breaks_page(para) {
+        if para.sect_break && !section_breaks_page(&sects, section_starts.len()) && pager.cols > 1 {
+            line_cols.resize(lines.len(), 0);
+            if let Some(b) = balance_columns(&mut lines, &mut line_cols, &mut boxes, section_first_line, pager.cols, col_w, gap * sc, pager.page) {
+                pager.y = b - pager.mt;
+                pager.max_y = pager.y;
+                pager.col = 0;
+                pager.col_top = pager.y;
+            }
+        }
+        if para.sect_break && section_breaks_page(&sects, section_starts.len()) {
             pager.force = true;
             pending_after = 0.0;
+        }
+        if para.sect_break {
+            section_starts.push(lines.len());
+            section_first_line = lines.len();
         }
         pi += 1;
     }
 
+    // Endnotes follow the last paragraph (below all columns), after a separator.
+    if pager.cols > 1 && has_endnotes {
+        line_cols.resize(lines.len(), 0);
+        let (ncols, gap) = section_columns(sects.get(section_starts.len()));
+        let col_w = ((pw - ml - mr) - gap * sc * (ncols as f32 - 1.0)) / ncols as f32;
+        if let Some(b) = balance_columns(&mut lines, &mut line_cols, &mut boxes, section_first_line, ncols, col_w, gap * sc, pager.page) {
+            pager.y = b - pager.mt;
+            pager.max_y = pager.y;
+        }
+    }
+    pager.set_columns(1);
+    let mut notes: Vec<NoteBox> = Vec::new();
+    let mut separators: Vec<(usize, f32)> = Vec::new();
+    if doc.notes.keys().any(|(e, _)| *e) {
+        let mut first = true;
+        for li in 0..lines.len() {
+            let pi = lines[li].para;
+            let refs = line_note_refs(doc, &ctx.obj_text, pi, &lines[li], true);
+            for (label, id) in refs {
+                let Some(nd) = doc.notes.get(&(true, id.clone())) else { continue };
+                if first {
+                    pager.y += 12.0 * sc;
+                    let (page, y) = pager.place(6.0 * sc);
+                    separators.push((page, y));
+                    first = false;
+                }
+                let nl = note_layout(doc, nd, ctx.fonts, zoom, &label);
+                let h = content_height(&nl);
+                let (page, y) = pager.place(h);
+                notes.push(NoteBox { page, y, key: (true, id), lay: nl });
+            }
+        }
+    }
+    // Footnotes stack up from the bottom margin of their page.
+    let body_bottom = ph - mb;
+    let mut by_page: BTreeMapPages = BTreeMapPages::new();
+    for (page, key, nl, h) in page_notes {
+        by_page.entry(page).or_default().push((key, nl, h));
+    }
+    for (page, list) in by_page {
+        let total: f32 = list.iter().map(|x| x.2).sum();
+        let mut y = body_bottom - total;
+        separators.push((page, y - 7.0 * sc));
+        for (key, nl, h) in list {
+            notes.push(NoteBox { page, y, key, lay: nl });
+            y += h;
+        }
+    }
+
     let pages = pager.page + 1;
+    let section_of_line = |li: usize| section_starts.iter().filter(|s| **s <= li).count();
+    let mut page_section = vec![0usize; pages];
+    let mut cur = 0;
+    for (pg, slot) in page_section.iter_mut().enumerate() {
+        if let Some(li) = lines.iter().position(|l| l.page == pg) {
+            cur = section_of_line(li);
+        }
+        *slot = cur;
+    }
+    let mut section_first_page = vec![0usize];
+    for s in &section_starts {
+        let pg = lines.get(*s).map(|l| l.page).unwrap_or(pages - 1);
+        section_first_page.push(pg);
+    }
     // Lines inside tables are emitted cell by cell; keep the page index ordered.
     let mut page_lines = vec![0..0; pages];
     for pg in 0..pages {
@@ -859,10 +1188,13 @@ pub fn layout(doc: &Document, fonts: &mut FontsView<'_>, zoom: f32) -> Layout {
         header,
         footers,
         hf,
-        hf_dy,
+        page_section,
+        section_first_page,
         rich_header,
         rich_footer,
         page_fields: find_page_fields(doc),
+        notes,
+        note_separators: separators,
     }
 }
 

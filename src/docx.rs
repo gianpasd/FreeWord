@@ -924,43 +924,59 @@ pub fn notes_from_parts(
     out
 }
 
-/// Rich headers and footers referenced by a body `w:sectPr`.
-pub fn hf_from_parts(
+/// Rich headers and footers for each section. References a section does not
+/// define are inherited from the previous section, as in Word.
+pub fn hf_sections(
     parts: &BTreeMap<String, Vec<u8>>,
-    sect_xml: Option<&str>,
+    sects: &[String],
     pkg_id: u64,
     sheet: &Arc<StyleSheet>,
     numbering: &Numbering,
-) -> crate::doc::HeaderFooter {
-    let mut hf = crate::doc::HeaderFooter::default();
-    let Some(sect) = sect_xml.and_then(|s| xml::parse(s).ok()) else { return hf };
+) -> Vec<crate::doc::HeaderFooter> {
     let main = read_rels(parts, "")
         .values()
         .find(|r| r.kind == "officeDocument")
         .map(|r| r.target.clone())
         .unwrap_or_else(|| "word/document.xml".into());
     let rels = read_rels(parts, &main);
-    hf.title_page = sect.child("titlePg").is_some_and(styles::on);
+    let mut cache: HashMap<String, Option<Box<Document>>> = HashMap::new();
     let mut base = 1_000_000;
-    for e in sect.elems() {
-        let is_header = match e.name.as_str() {
-            "headerReference" => true,
-            "footerReference" => false,
-            _ => continue,
+    // (header?, type) -> part target, carried forward across sections.
+    let mut current: HashMap<(bool, String), String> = HashMap::new();
+    let mut out = Vec::new();
+    for sx in sects {
+        let Ok(sect) = xml::parse(sx) else {
+            out.push(crate::doc::HeaderFooter::default());
+            continue;
         };
-        let Some(target) = e.attr("id").and_then(|id| rels.get(id)).map(|r| r.target.clone()) else { continue };
-        let Some(d) = hf_document(parts, &target, pkg_id, sheet, numbering, base) else { continue };
-        base += 1_000_000;
-        let slot = match (is_header, e.attr("type").unwrap_or("default")) {
-            (true, "first") => &mut hf.header_first,
-            (true, "default") => &mut hf.header,
-            (false, "first") => &mut hf.footer_first,
-            (false, "default") => &mut hf.footer,
-            _ => continue,
+        for e in sect.elems() {
+            let is_header = match e.name.as_str() {
+                "headerReference" => true,
+                "footerReference" => false,
+                _ => continue,
+            };
+            if let Some(target) = e.attr("id").and_then(|id| rels.get(id)).map(|r| r.target.clone()) {
+                current.insert((is_header, e.attr("type").unwrap_or("default").to_string()), target);
+            }
+        }
+        let mut hf = crate::doc::HeaderFooter { title_page: sect.child("titlePg").is_some_and(styles::on), ..Default::default() };
+        let mut get = |header: bool, ty: &str, cache: &mut HashMap<String, Option<Box<Document>>>| -> Option<Box<Document>> {
+            let target = current.get(&(header, ty.to_string()))?.clone();
+            cache
+                .entry(target.clone())
+                .or_insert_with(|| {
+                    base += 1_000_000;
+                    hf_document(parts, &target, pkg_id, sheet, numbering, base).map(Box::new)
+                })
+                .clone()
         };
-        *slot = Some(Box::new(d));
+        hf.header = get(true, "default", &mut cache);
+        hf.header_first = get(true, "first", &mut cache);
+        hf.footer = get(false, "default", &mut cache);
+        hf.footer_first = get(false, "first", &mut cache);
+        out.push(hf);
     }
-    hf
+    out
 }
 
 /// Style sheet of a stored .docx package.
@@ -1097,7 +1113,11 @@ pub fn load_docx_bytes(bytes: &[u8]) -> Result<Document, String> {
     doc.tables = tables;
     doc.numbering = numbering;
     doc.styles = Arc::new(sheet);
-    doc.hf = Arc::new(hf_from_parts(&pkg.parts, pkg.body_sect.as_deref(), pkg_id, &doc.styles, &doc.numbering));
+    let mut sects: Vec<String> = paras.iter().filter(|p| p.sect_break).filter_map(|p| crate::doc::extract_sect_pr(&p.ppr_extra)).collect();
+    if let Some(b) = &pkg.body_sect {
+        sects.push(b.clone());
+    }
+    doc.hf = Arc::new(hf_sections(&pkg.parts, &sects, pkg_id, &doc.styles, &doc.numbering));
     doc.notes = Arc::new(notes_from_parts(&pkg.parts, pkg_id, &doc.styles, &doc.numbering));
     doc.pkg = Some(Arc::new(pkg));
     if !paras.is_empty() {

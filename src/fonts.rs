@@ -454,7 +454,7 @@ pub fn used_by(doc: &crate::doc::Document) -> Vec<String> {
         }
     };
     visit(doc);
-    for d in [&doc.hf.header, &doc.hf.header_first, &doc.hf.footer, &doc.hf.footer_first].into_iter().flatten() {
+    for d in doc.hf_docs() {
         visit(d);
     }
     ids.into_iter().map(font_name).collect()

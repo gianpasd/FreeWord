@@ -356,7 +356,6 @@ pub fn load_native(path: &Path) -> Result<Document, String> {
         None => doc.numbering = Numbering::new_default(),
     }
     if let Some(pkg) = doc.pkg.clone() {
-        doc.hf = Arc::new(crate::docx::hf_from_parts(&pkg.parts, pkg.body_sect.as_deref(), pkg.id, &doc.styles, &doc.numbering));
         doc.notes = Arc::new(crate::docx::notes_from_parts(&pkg.parts, pkg.id, &doc.styles, &doc.numbering));
     }
     for im in fd.images {
@@ -426,6 +425,9 @@ pub fn load_native(path: &Path) -> Result<Document, String> {
     }
     if doc.paras.is_empty() {
         doc.paras.push(Para::new(Style::Normal));
+    }
+    if let Some(pkg) = doc.pkg.clone() {
+        doc.hf = Arc::new(crate::docx::hf_sections(&pkg.parts, &doc.section_props(), pkg.id, &doc.styles, &doc.numbering));
     }
     doc.ensure_trailing_para();
     Ok(doc)
