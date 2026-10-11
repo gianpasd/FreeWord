@@ -145,10 +145,73 @@ try {
     $s.TypeParagraph()
     Para $s "Final paragraph."
     Save-Doc $d "06_objects.docx"
+
+    # 7. Equations, text box, shape, chart, SmartArt, content control
+    $d = New-Doc; $s = $word.Selection
+    Para $s "Rich objects" "Heading 1"
+    $s.Style = "Normal"
+    $s.TypeText("Equation: ")
+    $r = $s.Range
+    $r.Text = "x=(-b+sqrt(b^2-4ac))/2a"
+    $d.OMaths.Add($r) | Out-Null
+    $d.OMaths.Item(1).BuildUp()
+    $s.EndKey(6) | Out-Null
+    $s.TypeParagraph()
+    $tb = $d.Shapes.AddTextbox(1, 300, 150, 150, 60)
+    $tb.TextFrame.TextRange.Text = "Text inside a text box"
+    $d.Shapes.AddShape(9, 100, 250, 80, 50) | Out-Null
+    $s.EndKey(6) | Out-Null
+    try { $d.InlineShapes.AddChart2(-1, 51) | Out-Null } catch { }
+    $s.EndKey(6) | Out-Null
+    $s.TypeParagraph()
+    try { $d.InlineShapes.AddSmartArt($word.Application.SmartArtLayouts.Item(1)) | Out-Null } catch { }
+    $s.EndKey(6) | Out-Null
+    $s.TypeParagraph()
+    $cc = $d.ContentControls.Add(1)
+    $cc.Range.Text = "Content control text"
+    $d.Content.InsertParagraphAfter()
+    $s.EndKey(6) | Out-Null
+    Para $s "After the objects."
+    Save-Doc $d "07_rich_objects.docx"
+
+    # 8. Nested table, columns, endnotes, first-page header, bookmark + cross reference
+    $d = New-Doc; $s = $word.Selection
+    $d.PageSetup.DifferentFirstPageHeaderFooter = $true
+    $d.Sections.Item(1).Headers.Item(2).Range.Text = "First page header"
+    $d.Sections.Item(1).Headers.Item(1).Range.Text = "Other pages header"
+    Para $s "Advanced layout" "Heading 1"
+    $s.Style = "Normal"
+    $t = $d.Tables.Add($s.Range, 2, 2)
+    $t.Borders.Enable = $true
+    $t.Cell(1, 1).Range.Text = "Outer"
+    $inner = $t.Cell(2, 2).Tables.Add($t.Cell(2, 2).Range, 2, 2)
+    $inner.Borders.Enable = $true
+    $inner.Cell(1, 1).Range.Text = "Inner"
+    $s.EndKey(6) | Out-Null
+    $s.TypeParagraph()
+    $bm = $s.Range
+    $s.TypeText("Bookmarked sentence.")
+    $d.Bookmarks.Add("Target", $d.Range($bm.Start, $s.Start)) | Out-Null
+    $s.TypeText(" See endnote")
+    $d.Endnotes.Add($s.Range, [Type]::Missing, "Endnote text.") | Out-Null
+    $s.EndKey(6) | Out-Null
+    $s.TypeText(". Cross reference: ")
+    $s.InsertCrossReference("Bookmark", 1, "Target", $true, $false)
+    $s.TypeParagraph()
+    $s.InsertBreak(3)
+    $d.Sections.Item($d.Sections.Count).PageSetup.TextColumns.SetCount(2)
+    Para $s ("Two column text. " * 60)
+    $s.ParagraphFormat.LineSpacingRule = 4
+    $s.ParagraphFormat.LineSpacing = 18
+    Para $s "Exact line spacing paragraph."
+    $s.Font.Hidden = 1; $s.TypeText("hidden text"); $s.Font.Hidden = 0
+    $s.TypeParagraph()
+    Save-Doc $d "08_advanced.docx"
 }
 finally {
     $word.Quit()
     [System.Runtime.InteropServices.Marshal]::ReleaseComObject($word) | Out-Null
 }
+
 
 
