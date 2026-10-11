@@ -1,482 +1,144 @@
 //! Microsoft Word (.docx) import and export.
+//!
+//! Import resolves styles, theme fonts, numbering and tables into FreeWord's
+//! model. Everything FreeWord does not model is kept: unknown paragraph and
+//! run properties as raw XML, unknown inline content (fields, bookmarks,
+//! comments, revisions, equations, shapes...) as opaque objects, and every
+//! other part of the package (styles, theme, settings, footnotes, headers...)
+//! byte for byte. Export writes formatting as differences from the styles.
 
 use crate::doc::{
-    Align, CharFmt, Document, LINE_BREAK, ListKind, OBJ, PAGE_BREAK, Para, Rgba, Style,
+    Align, CellProps, CellRef, CharFmt, COLUMN_BREAK, Document, ImageData, LINE_BREAK, Leader, LineRule,
+    ListKind, OBJ, PAGE_BREAK, Package, PageSetup, Para, RowProps, Style, TabKind, TabStop, Table, VMerge,
 };
 use crate::fonts;
-use crate::io::{hex, image_from_bytes, image_kind, parse_hex, runs};
-use crate::xml::{self, El, esc};
-use std::collections::HashMap;
-use std::fs::File;
-use std::io::{Read, Write};
+use crate::io::{hex, image_from_bytes, image_kind};
+use crate::numbering::Numbering;
+use crate::pool::{self, ObjKind, RawObj};
+use crate::styles::{self, HIGHLIGHTS, PProps, StyleSheet};
+use crate::xml::{self, El, esc, esc_text};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::io::{Cursor, Read, Write};
 use std::path::Path;
+use std::sync::Arc;
 use zip::write::SimpleFileOptions;
 
 const W_NS: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
 const R_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+const REL_T: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+const NBH: char = '\u{2011}';
+const SHY: char = '\u{00AD}';
 
-const HIGHLIGHTS: &[(&str, Rgba)] = &[
-    ("yellow", [255, 255, 0, 255]),
-    ("green", [0, 255, 0, 255]),
-    ("cyan", [0, 255, 255, 255]),
-    ("magenta", [255, 0, 255, 255]),
-    ("blue", [0, 0, 255, 255]),
-    ("red", [255, 0, 0, 255]),
-    ("darkBlue", [0, 0, 128, 255]),
-    ("darkCyan", [0, 128, 128, 255]),
-    ("darkGreen", [0, 128, 0, 255]),
-    ("darkMagenta", [128, 0, 128, 255]),
-    ("darkRed", [128, 0, 0, 255]),
-    ("darkYellow", [128, 128, 0, 255]),
-    ("darkGray", [128, 128, 128, 255]),
-    ("lightGray", [192, 192, 192, 255]),
-    ("black", [0, 0, 0, 255]),
-    ("white", [255, 255, 255, 255]),
+/// Schema order of `w:rPr` children.
+const RPR_ORDER: &[&str] = &[
+    "rStyle", "rFonts", "b", "bCs", "i", "iCs", "caps", "smallCaps", "strike", "dstrike", "outline", "shadow",
+    "emboss", "imprint", "noProof", "snapToGrid", "vanish", "webHidden", "color", "spacing", "w", "kern",
+    "position", "sz", "szCs", "highlight", "u", "effect", "bdr", "shd", "fitText", "vertAlign", "rtl", "cs",
+    "em", "lang", "eastAsianLayout", "specVanish", "oMath", "ins", "del", "moveFrom", "moveTo", "rPrChange",
 ];
 
-// ================================================================ export
+/// Schema order of `w:pPr` children.
+const PPR_ORDER: &[&str] = &[
+    "pStyle", "keepNext", "keepLines", "pageBreakBefore", "framePr", "widowControl", "numPr",
+    "suppressLineNumbers", "pBdr", "shd", "tabs", "suppressAutoHyphens", "kinsoku", "wordWrap",
+    "overflowPunct", "topLinePunct", "autoSpaceDE", "autoSpaceDN", "bidi", "adjustRightInd", "snapToGrid",
+    "spacing", "ind", "contextualSpacing", "mirrorIndents", "suppressOverlap", "jc", "textDirection",
+    "textAlignment", "textboxTightWrap", "outlineLvl", "divId", "cnfStyle", "rPr", "sectPr", "pPrChange",
+];
 
-fn rpr_xml(f: &CharFmt) -> String {
-    let font = esc(&fonts::font_name(f.font));
-    let mut s = format!("<w:rPr><w:rFonts w:ascii=\"{font}\" w:hAnsi=\"{font}\" w:cs=\"{font}\"/>");
-    if f.bold {
-        s.push_str("<w:b/>");
-    }
-    if f.italic {
-        s.push_str("<w:i/>");
-    }
-    if f.strike {
-        s.push_str("<w:strike/>");
-    }
-    s.push_str(&format!("<w:color w:val=\"{}\"/>", hex(f.color)));
-    let hp = (f.size * 2.0).round() as i32;
-    s.push_str(&format!("<w:sz w:val=\"{hp}\"/><w:szCs w:val=\"{hp}\"/>"));
-    let named = (f.highlight[3] > 0)
-        .then(|| HIGHLIGHTS.iter().find(|(_, c)| c[..3] == f.highlight[..3]))
-        .flatten();
-    if let Some((name, _)) = named {
-        s.push_str(&format!("<w:highlight w:val=\"{name}\"/>"));
-    }
-    if f.underline {
-        s.push_str("<w:u w:val=\"single\"/>");
-    }
-    if f.highlight[3] > 0 && named.is_none() {
-        s.push_str(&format!("<w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"{}\"/>", hex(f.highlight)));
-    }
-    match f.script {
-        1 => s.push_str("<w:vertAlign w:val=\"superscript\"/>"),
-        -1 => s.push_str("<w:vertAlign w:val=\"subscript\"/>"),
-        _ => {}
-    }
-    s.push_str("</w:rPr>");
-    s
+/// Schema order of `w:tcPr` children.
+const TCPR_ORDER: &[&str] = &[
+    "cnfStyle", "tcW", "gridSpan", "hMerge", "vMerge", "tcBorders", "shd", "noWrap", "tcMar", "textDirection",
+    "tcFitText", "vAlign", "hideMark", "headers", "cellIns", "cellDel", "cellMerge", "tcPrChange",
+];
+
+const RPR_MODELED: &[&str] = &[
+    "rFonts", "b", "bCs", "i", "iCs", "u", "strike", "dstrike", "caps", "smallCaps", "vanish", "color", "sz",
+    "szCs", "spacing", "highlight", "shd", "vertAlign",
+];
+const PPR_MODELED: &[&str] = &[
+    "pStyle", "numPr", "spacing", "ind", "jc", "contextualSpacing", "pageBreakBefore", "shd", "tabs", "rPr",
+];
+
+fn order_of(order: &[&str], name: &str) -> usize {
+    order.iter().position(|n| *n == name).unwrap_or(order.len())
 }
 
-fn text_run_xml(text: &str, f: &CharFmt) -> String {
-    let mut s = String::from("<w:r>");
-    s.push_str(&rpr_xml(f));
-    let mut buf = String::new();
-    let flush = |buf: &mut String, s: &mut String| {
-        if !buf.is_empty() {
-            s.push_str(&format!("<w:t xml:space=\"preserve\">{}</w:t>", esc(buf)));
-            buf.clear();
-        }
-    };
-    for c in text.chars() {
-        match c {
-            '\t' => {
-                flush(&mut buf, &mut s);
-                s.push_str("<w:tab/>");
-            }
-            LINE_BREAK => {
-                flush(&mut buf, &mut s);
-                s.push_str("<w:br/>");
-            }
-            PAGE_BREAK => {
-                flush(&mut buf, &mut s);
-                s.push_str("<w:br w:type=\"page\"/>");
-            }
-            OBJ => {}
-            c => buf.push(c),
-        }
-    }
-    flush(&mut buf, &mut s);
-    s.push_str("</w:r>");
-    s
+/// Sorts (local name, xml) pairs into schema order and concatenates them.
+fn ordered(order: &[&str], mut items: Vec<(String, String)>) -> String {
+    items.sort_by_key(|(n, _)| order_of(order, n));
+    items.into_iter().map(|(_, x)| x).collect()
 }
 
-fn image_run_xml(id: u32, w_pt: f32, h_pt: f32, f: &CharFmt) -> String {
-    let cx = (w_pt * 12700.0) as i64;
-    let cy = (h_pt * 12700.0) as i64;
-    format!(
-        "<w:r>{rpr}<w:drawing><wp:inline distT=\"0\" distB=\"0\" distL=\"0\" distR=\"0\">\
-<wp:extent cx=\"{cx}\" cy=\"{cy}\"/><wp:docPr id=\"{id}\" name=\"Picture {id}\"/>\
-<a:graphic><a:graphicData uri=\"http://schemas.openxmlformats.org/drawingml/2006/picture\">\
-<pic:pic><pic:nvPicPr><pic:cNvPr id=\"{id}\" name=\"image{id}\"/><pic:cNvPicPr/></pic:nvPicPr>\
-<pic:blipFill><a:blip r:embed=\"rIdImg{id}\"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill>\
-<pic:spPr><a:xfrm><a:off x=\"0\" y=\"0\"/><a:ext cx=\"{cx}\" cy=\"{cy}\"/></a:xfrm>\
-<a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom></pic:spPr></pic:pic></a:graphicData></a:graphic>\
-</wp:inline></w:drawing></w:r>",
-        rpr = rpr_xml(f)
-    )
+fn twips_attr(e: &El, key: &str) -> Option<f32> {
+    e.attr(key).and_then(|v| v.parse::<f32>().ok()).map(|v| v / 20.0)
 }
 
-fn para_xml(p: &Para, doc: &Document, num_id: Option<u32>) -> String {
-    let mut s = String::from("<w:p><w:pPr>");
-    if p.style != Style::Normal {
-        s.push_str(&format!("<w:pStyle w:val=\"{}\"/>", p.style.docx_id()));
-    }
-    if let Some(n) = num_id {
-        s.push_str(&format!("<w:numPr><w:ilvl w:val=\"{}\"/><w:numId w:val=\"{n}\"/></w:numPr>", p.level));
-    }
-    s.push_str(&format!(
-        "<w:spacing w:before=\"{}\" w:after=\"{}\" w:line=\"{}\" w:lineRule=\"auto\"/>",
-        (p.space_before * 20.0).round() as i32,
-        (p.space_after * 20.0).round() as i32,
-        (p.line_spacing * 240.0).round() as i32
-    ));
-    if num_id.is_none() && p.level > 0 {
-        let quote = if p.style == Style::Quote { 720 } else { 0 };
-        s.push_str(&format!("<w:ind w:left=\"{}\"/>", p.level as i32 * 720 + quote));
-    }
-    let jc = match p.align {
-        Align::Left => None,
-        Align::Center => Some("center"),
-        Align::Right => Some("right"),
-        Align::Justify => Some("both"),
-    };
-    if let Some(j) = jc {
-        s.push_str(&format!("<w:jc w:val=\"{j}\"/>"));
-    }
-    s.push_str(&rpr_xml(&p.end_fmt));
-    s.push_str("</w:pPr>");
-    for (text, f) in runs(p) {
-        if f.image != 0 {
-            if let Some(img) = doc.images.get(&f.image) {
-                s.push_str(&image_run_xml(f.image, img.w, img.h, &f));
-            }
-        } else {
-            s.push_str(&text_run_xml(&text, &f));
-        }
-    }
-    s.push_str("</w:p>");
-    s
-}
-
-fn style_xml(st: Style) -> String {
-    let f = st.char_fmt();
-    let (b, a) = st.spacing();
-    let mut ppr = format!(
-        "<w:pPr><w:spacing w:before=\"{}\" w:after=\"{}\" w:line=\"{}\" w:lineRule=\"auto\"/>",
-        (b * 20.0) as i32,
-        (a * 20.0) as i32,
-        (st.line_spacing() * 240.0) as i32
-    );
-    if st == Style::Quote {
-        ppr.push_str("<w:ind w:left=\"720\" w:right=\"720\"/>");
-    }
-    let outline = match st {
-        Style::Heading1 => Some(0),
-        Style::Heading2 => Some(1),
-        Style::Heading3 => Some(2),
-        _ => None,
-    };
-    if let Some(o) = outline {
-        ppr.push_str(&format!("<w:outlineLvl w:val=\"{o}\"/>"));
-    }
-    ppr.push_str("</w:pPr>");
-    let name = match st {
-        Style::Heading1 => "heading 1",
-        Style::Heading2 => "heading 2",
-        Style::Heading3 => "heading 3",
-        s => s.name(),
-    };
-    let default = if st == Style::Normal { " w:default=\"1\"" } else { "" };
-    let based = if st == Style::Normal {
-        String::new()
-    } else {
-        "<w:basedOn w:val=\"Normal\"/><w:next w:val=\"Normal\"/>".to_string()
-    };
-    format!(
-        "<w:style w:type=\"paragraph\"{default} w:styleId=\"{}\"><w:name w:val=\"{name}\"/>{based}<w:qFormat/>{ppr}{}</w:style>",
-        st.docx_id(),
-        rpr_xml(&f)
-    )
-}
-
-fn numbering_xml(numbered_lists: u32) -> String {
-    let mut s = format!("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<w:numbering xmlns:w=\"{W_NS}\">");
-    // abstract 0: bullets
-    s.push_str("<w:abstractNum w:abstractNumId=\"0\"><w:multiLevelType w:val=\"hybridMultilevel\"/>");
-    for l in 0..9 {
-        let sym = crate::doc::bullet_char(l as u8);
-        s.push_str(&format!(
-            "<w:lvl w:ilvl=\"{l}\"><w:start w:val=\"1\"/><w:numFmt w:val=\"bullet\"/><w:lvlText w:val=\"{sym}\"/><w:lvlJc w:val=\"left\"/><w:pPr><w:ind w:left=\"{}\" w:hanging=\"360\"/></w:pPr></w:lvl>",
-            720 * l + 360
-        ));
-    }
-    s.push_str("</w:abstractNum>");
-    // abstract 1: numbers
-    s.push_str("<w:abstractNum w:abstractNumId=\"1\"><w:multiLevelType w:val=\"hybridMultilevel\"/>");
-    for l in 0..9 {
-        let fmt = ["decimal", "lowerLetter", "lowerRoman"][l % 3];
-        s.push_str(&format!(
-            "<w:lvl w:ilvl=\"{l}\"><w:start w:val=\"1\"/><w:numFmt w:val=\"{fmt}\"/><w:lvlText w:val=\"%{}.\"/><w:lvlJc w:val=\"left\"/><w:pPr><w:ind w:left=\"{}\" w:hanging=\"360\"/></w:pPr></w:lvl>",
-            l + 1,
-            720 * l + 360
-        ));
-    }
-    s.push_str("</w:abstractNum>");
-    s.push_str("<w:num w:numId=\"1\"><w:abstractNumId w:val=\"0\"/></w:num>");
-    for i in 0..numbered_lists {
-        s.push_str(&format!(
-            "<w:num w:numId=\"{}\"><w:abstractNumId w:val=\"1\"/><w:lvlOverride w:ilvl=\"0\"><w:startOverride w:val=\"1\"/></w:lvlOverride></w:num>",
-            i + 2
-        ));
-    }
-    s.push_str("</w:numbering>");
-    s
-}
-
-fn hf_xml(tag: &str, text: &str, page_numbers: bool) -> String {
-    let mut s = format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<w:{tag} xmlns:w=\"{W_NS}\" xmlns:r=\"{R_NS}\"><w:p><w:pPr><w:jc w:val=\"center\"/></w:pPr>"
-    );
-    let gray = "<w:rPr><w:color w:val=\"595959\"/><w:sz w:val=\"20\"/></w:rPr>";
-    if !text.is_empty() {
-        s.push_str(&format!("<w:r>{gray}<w:t xml:space=\"preserve\">{}</w:t></w:r>", esc(text)));
-    }
-    if page_numbers {
-        let sep = if text.is_empty() { "" } else { "    " };
-        s.push_str(&format!("<w:r>{gray}<w:t xml:space=\"preserve\">{sep}Page </w:t></w:r>"));
-        s.push_str(&format!("<w:fldSimple w:instr=\" PAGE \"><w:r>{gray}<w:t>1</w:t></w:r></w:fldSimple>"));
-        s.push_str(&format!("<w:r>{gray}<w:t xml:space=\"preserve\"> of </w:t></w:r>"));
-        s.push_str(&format!("<w:fldSimple w:instr=\" NUMPAGES \"><w:r>{gray}<w:t>1</w:t></w:r></w:fldSimple>"));
-    }
-    s.push_str(&format!("</w:p></w:{tag}>"));
-    s
-}
-
-pub fn save_docx(doc: &Document, path: &Path) -> Result<(), String> {
-    let err = |e: &dyn std::fmt::Display| e.to_string();
-
-    // Body; numbered lists get their own numbering instance so they restart at 1.
-    let mut body = String::new();
-    let mut num_lists = 0u32;
-    let mut in_numbered = false;
-    for p in &doc.paras {
-        let num_id = match p.list {
-            ListKind::None => {
-                in_numbered = false;
-                None
-            }
-            ListKind::Bullet => Some(1),
-            ListKind::Number => {
-                if !in_numbered {
-                    num_lists += 1;
-                    in_numbered = true;
-                }
-                Some(num_lists + 1)
-            }
-        };
-        body.push_str(&para_xml(p, doc, num_id));
-    }
-    let has_header = !doc.header.is_empty();
-    let has_footer = !doc.footer.is_empty() || doc.page_numbers;
-    let mut sect = String::from("<w:sectPr>");
-    if has_header {
-        sect.push_str("<w:headerReference w:type=\"default\" r:id=\"rIdHeader1\"/>");
-    }
-    if has_footer {
-        sect.push_str("<w:footerReference w:type=\"default\" r:id=\"rIdFooter1\"/>");
-    }
-    let pg = &doc.page;
-    let tw = |v: f32| (v * 20.0).round() as i32;
-    let orient = if pg.width > pg.height { " w:orient=\"landscape\"" } else { "" };
-    sect.push_str(&format!("<w:pgSz w:w=\"{}\" w:h=\"{}\"{orient}/>", tw(pg.width), tw(pg.height)));
-    sect.push_str(&format!(
-        "<w:pgMar w:top=\"{}\" w:right=\"{}\" w:bottom=\"{}\" w:left=\"{}\" w:header=\"720\" w:footer=\"720\" w:gutter=\"0\"/>",
-        tw(pg.margins[0]),
-        tw(pg.margins[1]),
-        tw(pg.margins[2]),
-        tw(pg.margins[3])
-    ));
-    sect.push_str("</w:sectPr>");
-
-    let document = format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
-<w:document xmlns:w=\"{W_NS}\" xmlns:r=\"{R_NS}\" \
-xmlns:wp=\"http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing\" \
-xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" \
-xmlns:pic=\"http://schemas.openxmlformats.org/drawingml/2006/picture\">\
-<w:body>{body}{sect}</w:body></w:document>"
-    );
-
-    let mut styles = format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<w:styles xmlns:w=\"{W_NS}\">\
-<w:docDefaults><w:rPrDefault><w:rPr><w:rFonts w:ascii=\"{f}\" w:hAnsi=\"{f}\" w:cs=\"{f}\"/><w:sz w:val=\"22\"/><w:szCs w:val=\"22\"/></w:rPr></w:rPrDefault>\
-<w:pPrDefault><w:pPr><w:spacing w:after=\"160\" w:line=\"276\" w:lineRule=\"auto\"/></w:pPr></w:pPrDefault></w:docDefaults>",
-        f = esc(fonts::default_font())
-    );
-    for st in Style::ALL {
-        styles.push_str(&style_xml(st));
-    }
-    styles.push_str("</w:styles>");
-
-    let mut ct = String::from(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
-<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">\
-<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>\
-<Default Extension=\"xml\" ContentType=\"application/xml\"/>\
-<Default Extension=\"png\" ContentType=\"image/png\"/>\
-<Default Extension=\"jpeg\" ContentType=\"image/jpeg\"/>\
-<Default Extension=\"gif\" ContentType=\"image/gif\"/>\
-<Default Extension=\"bmp\" ContentType=\"image/bmp\"/>\
-<Override PartName=\"/word/document.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml\"/>\
-<Override PartName=\"/word/styles.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml\"/>\
-<Override PartName=\"/word/numbering.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml\"/>",
-    );
-    if has_header {
-        ct.push_str("<Override PartName=\"/word/header1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml\"/>");
-    }
-    if has_footer {
-        ct.push_str("<Override PartName=\"/word/footer1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.footer+xml\"/>");
-    }
-    ct.push_str("</Types>");
-
-    let rels = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
-<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\
-<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"word/document.xml\"/>\
-</Relationships>";
-
-    let rt = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
-    let mut doc_rels = format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
-<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\
-<Relationship Id=\"rIdStyles\" Type=\"{rt}/styles\" Target=\"styles.xml\"/>\
-<Relationship Id=\"rIdNumbering\" Type=\"{rt}/numbering\" Target=\"numbering.xml\"/>"
-    );
-    if has_header {
-        doc_rels.push_str(&format!("<Relationship Id=\"rIdHeader1\" Type=\"{rt}/header\" Target=\"header1.xml\"/>"));
-    }
-    if has_footer {
-        doc_rels.push_str(&format!("<Relationship Id=\"rIdFooter1\" Type=\"{rt}/footer\" Target=\"footer1.xml\"/>"));
-    }
-    let mut media = Vec::new();
-    for (id, img) in &doc.images {
-        let (ext, _) = image_kind(&img.bytes);
-        let name = format!("media/image{id}.{ext}");
-        doc_rels.push_str(&format!("<Relationship Id=\"rIdImg{id}\" Type=\"{rt}/image\" Target=\"{name}\"/>"));
-        media.push((format!("word/{name}"), img.bytes.clone()));
-    }
-    doc_rels.push_str("</Relationships>");
-
-    let file = File::create(path).map_err(|e| err(&e))?;
-    let mut zip = zip::ZipWriter::new(file);
-    let opts = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
-    let mut put = |name: &str, data: &[u8]| -> Result<(), String> {
-        zip.start_file(name, opts).map_err(|e| err(&e))?;
-        zip.write_all(data).map_err(|e| err(&e))
-    };
-    put("[Content_Types].xml", ct.as_bytes())?;
-    put("_rels/.rels", rels.as_bytes())?;
-    put("word/document.xml", document.as_bytes())?;
-    put("word/_rels/document.xml.rels", doc_rels.as_bytes())?;
-    put("word/styles.xml", styles.as_bytes())?;
-    put("word/numbering.xml", numbering_xml(num_lists).as_bytes())?;
-    if has_header {
-        put("word/header1.xml", hf_xml("hdr", &doc.header, false).as_bytes())?;
-    }
-    if has_footer {
-        put("word/footer1.xml", hf_xml("ftr", &doc.footer, doc.page_numbers).as_bytes())?;
-    }
-    for (name, bytes) in &media {
-        put(name, bytes)?;
-    }
-    zip.finish().map_err(|e| err(&e))?;
-    Ok(())
+fn tw(v: f32) -> i32 {
+    (v * 20.0).round() as i32
 }
 
 // ================================================================ import
 
-struct Ctx {
-    styles: HashMap<String, Style>,
-    /// (numId, ilvl) -> is bullet
-    bullets: HashMap<(String, u8), bool>,
-    rels: HashMap<String, String>,
-    media: HashMap<String, Vec<u8>>,
-    images: Vec<(u32, crate::doc::ImageData)>,
-    next_image: u32,
+struct Rel {
+    kind: String,
+    target: String,
+    external: bool,
 }
 
-fn read_entry(zip: &mut zip::ZipArchive<File>, name: &str) -> Option<Vec<u8>> {
-    let mut f = zip.by_name(name).ok()?;
-    let mut v = Vec::new();
-    f.read_to_end(&mut v).ok()?;
-    Some(v)
+/// Reads relationships of `part` (e.g. `word/document.xml`).
+fn read_rels(parts: &BTreeMap<String, Vec<u8>>, part: &str) -> HashMap<String, Rel> {
+    let (dir, file) = part.rsplit_once('/').unwrap_or(("", part));
+    let rels_name = if dir.is_empty() { format!("_rels/{file}.rels") } else { format!("{dir}/_rels/{file}.rels") };
+    let mut out = HashMap::new();
+    let Some(bytes) = parts.get(&rels_name) else { return out };
+    let Ok(root) = xml::parse(&String::from_utf8_lossy(bytes)) else { return out };
+    for r in root.elems() {
+        let (Some(id), Some(t)) = (r.attr("Id"), r.attr("Target")) else { continue };
+        let external = r.attr("TargetMode") == Some("External");
+        let target = if external {
+            t.to_string()
+        } else if let Some(abs) = t.strip_prefix('/') {
+            abs.to_string()
+        } else {
+            normalize_path(&if dir.is_empty() { t.to_string() } else { format!("{dir}/{t}") })
+        };
+        let kind = r.attr("Type").unwrap_or("").rsplit('/').next().unwrap_or("").to_string();
+        out.insert(id.to_string(), Rel { kind, target, external });
+    }
+    out
 }
 
-fn read_xml(zip: &mut zip::ZipArchive<File>, name: &str) -> Option<El> {
-    let bytes = read_entry(zip, name)?;
-    xml::parse(&String::from_utf8_lossy(&bytes)).ok()
-}
-
-fn on(e: &El) -> bool {
-    !matches!(e.attr("val"), Some("0" | "false" | "off" | "none"))
-}
-
-fn apply_rpr(rpr: &El, f: &mut CharFmt) {
-    for e in rpr.elems() {
-        match e.name.as_str() {
-            "rFonts" => {
-                if let Some(n) = e.attr("ascii").or(e.attr("hAnsi")) {
-                    f.font = fonts::font_id(n);
-                }
+fn normalize_path(p: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    for seg in p.split('/') {
+        match seg {
+            ".." => {
+                out.pop();
             }
-            "b" => f.bold = on(e),
-            "i" => f.italic = on(e),
-            "u" => f.underline = on(e),
-            "strike" | "dstrike" => f.strike = on(e),
-            "color" => {
-                if let Some(c) = e.attr("val").and_then(parse_hex) {
-                    f.color = c;
-                }
-            }
-            "sz" => {
-                if let Some(v) = e.attr("val").and_then(|v| v.parse::<f32>().ok()) {
-                    f.size = (v / 2.0).max(1.0);
-                }
-            }
-            "highlight" => {
-                if let Some(v) = e.attr("val") {
-                    f.highlight = HIGHLIGHTS
-                        .iter()
-                        .find(|(n, _)| n.eq_ignore_ascii_case(v))
-                        .map(|(_, c)| *c)
-                        .unwrap_or(crate::doc::NO_COLOR);
-                }
-            }
-            "shd" => {
-                if let Some(c) = e.attr("fill").and_then(parse_hex) {
-                    if c[..3] != [255, 255, 255] {
-                        f.highlight = c;
-                    }
-                }
-            }
-            "vertAlign" => {
-                f.script = match e.attr("val") {
-                    Some("superscript") => 1,
-                    Some("subscript") => -1,
-                    _ => 0,
-                }
-            }
-            _ => {}
+            "." | "" => {}
+            s => out.push(s),
         }
     }
+    out.join("/")
 }
 
-fn twips(e: &El, key: &str) -> Option<f32> {
-    e.attr(key).and_then(|v| v.parse::<f32>().ok()).map(|v| v / 20.0)
+fn part_xml(parts: &BTreeMap<String, Vec<u8>>, name: &str) -> Option<El> {
+    let bytes = parts.get(name)?;
+    let s = String::from_utf8_lossy(bytes);
+    xml::parse(s.trim_start_matches('\u{feff}')).ok()
+}
+
+struct Reader<'a> {
+    parts: &'a BTreeMap<String, Vec<u8>>,
+    rels: HashMap<String, Rel>,
+    sheet: &'a StyleSheet,
+    numbering: &'a Numbering,
+    pkg: u64,
+    images: BTreeMap<u32, ImageData>,
+    tables: BTreeMap<u32, Table>,
+    /// Inline objects found between paragraphs, attached to the next one.
+    pending: Vec<(u32, CharFmt)>,
 }
 
 fn push(p: &mut Para, c: char, f: CharFmt) {
@@ -484,176 +146,510 @@ fn push(p: &mut Para, c: char, f: CharFmt) {
     p.fmts.push(f);
 }
 
-fn run(r: &El, base: &CharFmt, p: &mut Para, cx: &mut Ctx) {
-    let mut f = *base;
-    if let Some(rpr) = r.child("rPr") {
-        apply_rpr(rpr, &mut f);
+impl Reader<'_> {
+    fn obj(&self, xml: String, kind: ObjKind) -> u32 {
+        pool::add_obj(RawObj { xml, kind, pkg: self.pkg })
     }
-    for e in r.elems() {
-        match e.name.as_str() {
-            "t" => {
-                for c in e.text().chars() {
-                    push(p, c, f);
+
+    fn push_obj(&self, p: &mut Para, f: &CharFmt, xml: String, kind: ObjKind) {
+        let id = self.obj(xml, kind);
+        let mut of = *f;
+        of.obj = id;
+        of.image = 0;
+        push(p, OBJ, of);
+    }
+
+    /// Splits rPr children into modeled properties (applied) and raw extras.
+    fn run_props(&self, rpr: &El, f: &mut CharFmt) {
+        self.sheet.apply_rpr(rpr, f);
+        let mut extra = String::new();
+        for e in rpr.elems() {
+            let fancy_u = e.name == "u" && !matches!(e.attr("val"), None | Some("single" | "none" | "0" | "false"));
+            let fancy_color = e.name == "color" && e.attr("themeColor").is_some();
+            if !RPR_MODELED.contains(&e.name.as_str()) || fancy_u || fancy_color {
+                extra.push_str(&e.to_xml());
+            }
+        }
+        f.rpr_extra = pool::intern(&extra);
+    }
+
+    fn paragraph(&mut self, el: &El, cell: Option<CellRef>, tbl_style: Option<&str>) -> Para {
+        let ppr = el.child("pPr");
+        let style_id = ppr
+            .and_then(|p| p.child_val("pStyle"))
+            .map(|s| s.to_string())
+            .or_else(|| self.sheet.default_para.clone());
+        let is_default_style = style_id == self.sheet.default_para;
+        let mut pp = self.sheet.para_props(style_id.as_deref(), self.numbering);
+        let mut base = self.sheet.char_fmt(style_id.as_deref(), None);
+        // Table style formatting applies to paragraphs using the default style.
+        if let (Some(ts), true) = (tbl_style, is_default_style) {
+            if let Some(def) = self.sheet.styles.get(ts) {
+                if let Some(tp) = &def.ppr {
+                    self.sheet.apply_ppr(tp, &mut pp, self.numbering);
+                }
+                if let Some(tr) = &def.rpr {
+                    self.sheet.apply_rpr(tr, &mut base);
                 }
             }
-            "tab" => push(p, '\t', f),
-            "br" => push(p, if e.attr("type") == Some("page") { PAGE_BREAK } else { LINE_BREAK }, f),
-            "cr" => push(p, LINE_BREAK, f),
-            "noBreakHyphen" => push(p, '-', f),
-            "drawing" | "pict" | "object" => {
-                let Some(rid) = e.find("blip").and_then(|b| b.attr("embed")).or_else(|| e.find("imagedata").and_then(|b| b.attr("id"))) else {
-                    continue;
-                };
-                let Some(target) = cx.rels.get(rid) else { continue };
-                let Some(bytes) = cx.media.get(target).cloned() else { continue };
-                let Ok(mut img) = image_from_bytes(bytes, 6.5 * 72.0) else { continue };
-                if let Some(ext) = e.find("extent") {
-                    let cxv = ext.attr("cx").and_then(|v| v.parse::<f32>().ok());
-                    let cyv = ext.attr("cy").and_then(|v| v.parse::<f32>().ok());
-                    if let (Some(w), Some(h)) = (cxv, cyv) {
-                        img.w = w / 12700.0;
-                        img.h = h / 12700.0;
+        }
+        if let Some(ppr) = ppr {
+            self.sheet.apply_ppr(ppr, &mut pp, self.numbering);
+        }
+        let style = style_id
+            .as_deref()
+            .map(|id| Style::from_docx(id, self.sheet.style_name(id)))
+            .unwrap_or(Style::Normal);
+        let mut para = Para::new(style);
+        para.style_id = style_id.clone();
+        set_para_props(&mut para, &pp, self.numbering);
+        para.cell = cell;
+        if let Some(ppr) = ppr {
+            let mut extra = String::new();
+            for e in ppr.elems() {
+                if !PPR_MODELED.contains(&e.name.as_str()) {
+                    extra.push_str(&e.to_xml());
+                }
+                if e.name == "sectPr" {
+                    para.sect_break = true;
+                }
+            }
+            para.ppr_extra = extra;
+            let mut end = base;
+            if let Some(rpr) = ppr.child("rPr") {
+                self.run_props(rpr, &mut end);
+            }
+            para.end_fmt = end;
+        } else {
+            para.end_fmt = base;
+        }
+        for (id, f) in std::mem::take(&mut self.pending) {
+            let mut of = f;
+            of.obj = id;
+            push(&mut para, OBJ, of);
+        }
+        self.inline(el, &mut para, &base, 0);
+        para
+    }
+
+    fn inline(&mut self, el: &El, p: &mut Para, base: &CharFmt, link: u32) {
+        for c in el.elems() {
+            match c.name.as_str() {
+                "pPr" | "proofErr" | "lastRenderedPageBreak" => {}
+                "r" => self.run(c, p, base, link),
+                "hyperlink" => {
+                    let url = c
+                        .attr("id")
+                        .and_then(|id| self.rels.get(id))
+                        .filter(|r| r.external)
+                        .map(|r| r.target.clone())
+                        .unwrap_or_default();
+                    let anchor = c.attr("anchor").unwrap_or("");
+                    let id = pool::link_id(&url, anchor);
+                    self.inline(c, p, base, if id != 0 { id } else { link });
+                }
+                "ins" | "moveTo" => {
+                    // Keep tracked insertions as balanced start/end markers.
+                    let attrs: String = c.attrs.iter().map(|(k, v)| format!(" {k}=\"{}\"", esc(v))).collect();
+                    let mut f = *base;
+                    f.link = link;
+                    self.push_obj(p, &f, format!("<{}{attrs}>", c.qname), ObjKind::Wrap { open: true });
+                    self.inline(c, p, base, link);
+                    self.push_obj(p, &f, format!("</{}>", c.qname), ObjKind::Wrap { open: false });
+                }
+                "smartTag" | "customXml" | "dir" | "bdo" => self.inline(c, p, base, link),
+                "sdt" => {
+                    if let Some(content) = c.child("sdtContent") {
+                        self.inline(content, p, base, link);
                     }
                 }
-                let id = cx.next_image;
-                cx.next_image += 1;
-                cx.images.push((id, img));
-                let mut imf = f;
-                imf.image = id;
-                push(p, OBJ, imf);
+                "fldSimple" => {
+                    let instr = c.attr("instr").unwrap_or("").to_string();
+                    let mut f = *base;
+                    f.link = link;
+                    self.push_obj(p, &f, "<w:r><w:fldChar w:fldCharType=\"begin\"/></w:r>".into(), ObjKind::FieldBegin);
+                    self.push_obj(
+                        p,
+                        &f,
+                        format!("<w:r><w:instrText xml:space=\"preserve\">{}</w:instrText></w:r>", esc_text(&instr)),
+                        ObjKind::Hidden,
+                    );
+                    self.push_obj(p, &f, "<w:r><w:fldChar w:fldCharType=\"separate\"/></w:r>".into(), ObjKind::FieldSep);
+                    self.inline(c, p, base, link);
+                    self.push_obj(p, &f, "<w:r><w:fldChar w:fldCharType=\"end\"/></w:r>".into(), ObjKind::FieldEnd);
+                }
+                "oMath" | "oMathPara" => {
+                    let mut ts = Vec::new();
+                    c.find_all("t", &mut ts);
+                    let text: String = ts.iter().map(|t| t.text()).collect();
+                    let mut f = *base;
+                    f.italic = true;
+                    f.font = fonts::font_id(if fonts::is_available("Cambria") { "Cambria" } else { fonts::default_font() });
+                    self.push_obj(p, &f, c.to_xml(), ObjKind::Label(text));
+                }
+                _ => {
+                    let mut f = *base;
+                    f.link = link;
+                    self.push_obj(p, &f, c.to_xml(), ObjKind::Hidden);
+                }
             }
-            _ => {}
         }
     }
-}
 
-fn runs_in(el: &El, base: &CharFmt, p: &mut Para, cx: &mut Ctx) {
-    for e in el.elems() {
-        match e.name.as_str() {
-            "r" => run(e, base, p, cx),
-            "hyperlink" | "ins" | "smartTag" | "customXml" | "fldSimple" | "sdt" | "sdtContent" | "bdo" | "dir" => {
-                runs_in(e, base, p, cx)
+    fn run(&mut self, r: &El, p: &mut Para, base: &CharFmt, link: u32) {
+        let rpr = r.child("rPr");
+        let rstyle = rpr.and_then(|x| x.child_val("rStyle"));
+        let mut f = if rstyle.is_some() { self.sheet.char_fmt(p.style_id.as_deref(), rstyle) } else { *base };
+        if let Some(rpr) = rpr {
+            self.run_props(rpr, &mut f);
+        }
+        f.link = link;
+        let rpr_raw = rpr.map(|x| x.to_xml()).unwrap_or_default();
+        let raw_run = |c: &El| format!("<w:r>{rpr_raw}{}</w:r>", c.to_xml());
+        for c in r.elems() {
+            match c.name.as_str() {
+                "rPr" | "lastRenderedPageBreak" => {}
+                "t" | "delText" => {
+                    for ch in c.text().chars() {
+                        let ch = if ch == '\n' || ch == '\r' { ' ' } else { ch };
+                        push(p, ch, f);
+                    }
+                }
+                "tab" | "ptab" => push(p, '\t', f),
+                "br" => push(
+                    p,
+                    match c.attr("type") {
+                        Some("page") => PAGE_BREAK,
+                        Some("column") => COLUMN_BREAK,
+                        _ => LINE_BREAK,
+                    },
+                    f,
+                ),
+                "cr" => push(p, LINE_BREAK, f),
+                "noBreakHyphen" => push(p, NBH, f),
+                "softHyphen" => push(p, SHY, f),
+                "sym" => {
+                    let code = c.attr("char").and_then(|h| u32::from_str_radix(h, 16).ok()).unwrap_or(0x2022);
+                    let glyph = sym_glyph(code, c.attr("font"));
+                    self.push_obj(p, &f, raw_run(c), ObjKind::Label(glyph));
+                }
+                "drawing" | "pict" | "object" | "AlternateContent" => self.drawing(c, raw_run(c), &f, p),
+                "fldChar" => {
+                    let kind = match c.attr("fldCharType") {
+                        Some("begin") => ObjKind::FieldBegin,
+                        Some("separate") => ObjKind::FieldSep,
+                        _ => ObjKind::FieldEnd,
+                    };
+                    self.push_obj(p, &f, raw_run(c), kind);
+                }
+                "footnoteReference" | "endnoteReference" => {
+                    let kind = ObjKind::NoteRef {
+                        endnote: c.name == "endnoteReference",
+                        id: c.attr("id").unwrap_or("").to_string(),
+                    };
+                    self.push_obj(p, &f, raw_run(c), kind);
+                }
+                _ => self.push_obj(p, &f, raw_run(c), ObjKind::Hidden),
             }
-            _ => {}
         }
     }
-}
 
-fn paragraph(el: &El, cx: &mut Ctx) -> Para {
-    let ppr = el.child("pPr");
-    let style = ppr
-        .and_then(|p| p.child_val("pStyle"))
-        .map(|id| cx.styles.get(id).copied().unwrap_or_else(|| Style::from_docx(id, None)))
-        .unwrap_or(Style::Normal);
-    let mut para = Para::new(style);
-    let base = style.char_fmt();
-    if let Some(ppr) = ppr {
-        para.align = match ppr.child_val("jc") {
-            Some("center") => Align::Center,
-            Some("right" | "end") => Align::Right,
-            Some("both" | "distribute" | "justify") => Align::Justify,
-            _ => Align::Left,
+    fn drawing(&mut self, c: &El, raw: String, f: &CharFmt, p: &mut Para) {
+        let mut blips = Vec::new();
+        c.find_all("blip", &mut blips);
+        let mut embeds: Vec<&str> = blips.iter().filter_map(|b| b.attr("embed")).collect();
+        let mut vml = Vec::new();
+        c.find_all("imagedata", &mut vml);
+        embeds.extend(vml.iter().filter_map(|v| v.attr("id")));
+        embeds.sort();
+        embeds.dedup();
+        let other_refs = raw.contains(" r:id=\"") && vml.is_empty() || raw.contains(" r:link=") || raw.contains("c:chart") || raw.contains("dgm:");
+        // Size from wp:extent or VML style.
+        let mut size = c.find("extent").and_then(|e| {
+            let cx = e.attr("cx")?.parse::<f32>().ok()?;
+            let cy = e.attr("cy")?.parse::<f32>().ok()?;
+            Some((cx / 12700.0, cy / 12700.0))
+        });
+        if size.is_none() {
+            if let Some(shape) = c.find("shape").or_else(|| c.find("rect")) {
+                size = vml_size(shape.attr("style").unwrap_or(""));
+            }
+        }
+        if embeds.len() == 1 && !other_refs && !raw.contains("txbx") {
+            if let Some(bytes) = self.rels.get(embeds[0]).and_then(|r| self.parts.get(&r.target)) {
+                if let Ok(mut img) = image_from_bytes(bytes.clone(), f32::MAX) {
+                    if let Some((w, h)) = size {
+                        if w > 0.5 && h > 0.5 {
+                            img.w = w;
+                            img.h = h;
+                        }
+                    }
+                    img.raw = Some((raw, self.pkg));
+                    let id = self.images.keys().next_back().copied().unwrap_or(0) + 1;
+                    self.images.insert(id, img);
+                    let mut imf = *f;
+                    imf.image = id;
+                    imf.obj = 0;
+                    push(p, OBJ, imf);
+                    return;
+                }
+            }
+        }
+        let label = if raw.contains("c:chart") || raw.contains("/chart\"") {
+            "Chart".to_string()
+        } else if raw.contains("txbx") {
+            let mut paras = Vec::new();
+            c.find_all("txbxContent", &mut paras);
+            let t = paras.first().map(|t| t.run_text()).unwrap_or_default();
+            let t: String = t.chars().take(80).collect();
+            if t.trim().is_empty() { "Text box".into() } else { t }
+        } else if raw.contains("dgm:") {
+            "SmartArt".into()
+        } else if c.name == "object" || raw.contains("OLEObject") {
+            "Embedded object".into()
+        } else {
+            "Shape".into()
         };
-        if let Some(num) = ppr.child("numPr") {
-            let id = num.child_val("numId").unwrap_or("0").to_string();
-            let lvl: u8 = num.child_val("ilvl").and_then(|v| v.parse().ok()).unwrap_or(0);
-            if id != "0" {
-                let bullet = cx.bullets.get(&(id, lvl)).copied().unwrap_or(true);
-                para.list = if bullet { ListKind::Bullet } else { ListKind::Number };
-                para.level = lvl.min(8);
-            }
-        }
-        if let Some(sp) = ppr.child("spacing") {
-            if let Some(v) = twips(sp, "before") {
-                para.space_before = v;
-            }
-            if let Some(v) = twips(sp, "after") {
-                para.space_after = v;
-            }
-            if let Some(l) = sp.attr("line").and_then(|v| v.parse::<f32>().ok()) {
-                if matches!(sp.attr("lineRule"), None | Some("auto")) {
-                    para.line_spacing = (l / 240.0).clamp(0.5, 5.0);
-                }
-            }
-        }
-        if para.list == ListKind::None {
-            if let Some(ind) = ppr.child("ind") {
-                if let Some(left) = twips(ind, "left").or(twips(ind, "start")) {
-                    let quote = if style == Style::Quote { 36.0 } else { 0.0 };
-                    para.level = ((left - quote) / 36.0).round().clamp(0.0, 8.0) as u8;
-                }
-            }
-        }
-        let mut end = base;
-        if let Some(rpr) = ppr.child("rPr") {
-            apply_rpr(rpr, &mut end);
-        }
-        para.end_fmt = end.without_object();
+        let (w, h) = size.unwrap_or((72.0, 36.0));
+        let anchored = raw.contains("wp:anchor") || raw.contains("mso-position");
+        // Floating objects with zero size, or behind-text decorations, take no space.
+        let kind = if w < 1.0 || h < 1.0 {
+            ObjKind::Hidden
+        } else {
+            ObjKind::Box { label, w: w.min(468.0), h: if anchored { h.min(200.0) } else { h.min(600.0) } }
+        };
+        self.push_obj(p, f, raw, kind);
     }
-    runs_in(el, &base, &mut para, cx);
-    para
-}
 
-fn table(el: &El, cx: &mut Ctx, out: &mut Vec<Para>) {
-    for tr in el.elems().filter(|e| e.name == "tr") {
-        let mut row = Para::new(Style::Normal);
-        let mut first_cell = true;
-        for tc in tr.elems().filter(|e| e.name == "tc") {
-            if !first_cell {
-                let f = row.fmt_at(row.len());
-                push(&mut row, '\t', f);
+    fn table(&mut self, el: &El, out: &mut Vec<Para>, outer: Option<CellRef>) {
+        if let Some(cell) = outer {
+            // Nested tables are kept verbatim inside the outer cell.
+            let mut p = Para::new(Style::Normal);
+            p.cell = Some(cell);
+            p.raw_block = Some(el.to_xml());
+            let label = format!("[Nested table: {}]", el.run_text().chars().take(60).collect::<String>());
+            let mut f = self.sheet.char_fmt(None, None);
+            f.color = [0x80, 0x80, 0x80, 255];
+            f.italic = true;
+            for c in label.chars() {
+                push(&mut p, c, f);
             }
-            first_cell = false;
-            let mut first_p = true;
-            for p in tc.elems() {
-                let cell_para = match p.name.as_str() {
-                    "p" => paragraph(p, cx),
-                    "tbl" => {
-                        table(p, cx, out);
-                        continue;
-                    }
-                    _ => continue,
+            p.end_fmt = f;
+            out.push(p);
+            return;
+        }
+        let id = self.tables.keys().next_back().copied().unwrap_or(0) + 1;
+        let tblpr = el.child("tblPr");
+        let tbl_style = tblpr.and_then(|t| t.child_val("tblStyle")).map(|s| s.to_string());
+        let mut t = Table { tblpr_raw: tblpr.map(|x| x.to_xml()), ..Default::default() };
+        let direct_borders = tblpr.and_then(|x| x.child("tblBorders"));
+        t.borders = match direct_borders {
+            Some(b) => b.elems().any(|x| !matches!(x.attr("val"), Some("nil" | "none"))),
+            None => tbl_style.as_deref().is_some_and(|s| self.sheet.table_style_has_borders(s)),
+        };
+        if let Some(ind) = tblpr.and_then(|x| x.child("tblInd")) {
+            if ind.attr("type").is_none_or(|ty| ty == "dxa") {
+                t.indent = twips_attr(ind, "w").unwrap_or(0.0);
+            }
+        }
+        t.align = match tblpr.and_then(|x| x.child_val("jc")) {
+            Some("center") => Some(Align::Center),
+            Some("right" | "end") => Some(Align::Right),
+            _ => None,
+        };
+        if let Some(grid) = el.child("tblGrid") {
+            t.grid = grid.elems().filter(|g| g.name == "gridCol").map(|g| twips_attr(g, "w").unwrap_or(72.0)).collect();
+        }
+        let mut rows: Vec<&El> = Vec::new();
+        collect_named(el, "tr", &["sdt", "sdtContent", "customXml"], &mut rows);
+        let mut max_col = 0u32;
+        for (ri, tr) in rows.iter().enumerate() {
+            let ri = ri as u32;
+            let trpr = tr.child("trPr");
+            let mut rp = RowProps { trpr_raw: trpr.map(|x| x.to_xml()), ..Default::default() };
+            let mut col = 0u32;
+            if let Some(trpr) = trpr {
+                if let Some(h) = trpr.child("trHeight") {
+                    rp.height = twips_attr(h, "val").unwrap_or(0.0);
+                    rp.exact = h.attr("hRule") == Some("exact");
+                }
+                rp.header = trpr.child("tblHeader").is_some_and(styles::on);
+                col = trpr.child_val("gridBefore").and_then(|v| v.parse().ok()).unwrap_or(0);
+            }
+            t.rows.insert(ri, rp);
+            let mut cells: Vec<&El> = Vec::new();
+            collect_named(tr, "tc", &["sdt", "sdtContent", "customXml"], &mut cells);
+            for tc in cells {
+                let tcpr = tc.child("tcPr");
+                let span: u32 = tcpr.and_then(|x| x.child_val("gridSpan")).and_then(|v| v.parse().ok()).unwrap_or(1).max(1);
+                let vmerge = match tcpr.and_then(|x| x.child("vMerge")) {
+                    Some(v) if v.attr("val") == Some("restart") => VMerge::Restart,
+                    Some(_) => VMerge::Continue,
+                    None => VMerge::None,
                 };
-                if !first_p && !cell_para.chars.is_empty() {
-                    let f = row.fmt_at(row.len());
-                    push(&mut row, ' ', f);
+                let shade = tcpr.and_then(|x| x.child("shd")).and_then(styles::shd_fill);
+                t.cells.insert(
+                    (ri, col),
+                    CellProps { span, vmerge, shade, tcpr_raw: tcpr.map(|x| x.to_xml()) },
+                );
+                let cref = CellRef { table: id, row: ri, col };
+                let before = out.len();
+                self.block_children(tc, out, Some(cref), tbl_style.as_deref());
+                if out.len() == before {
+                    let mut p = Para::new(Style::Normal);
+                    p.cell = Some(cref);
+                    out.push(p);
                 }
-                first_p = false;
-                row.chars.extend(cell_para.chars);
-                row.fmts.extend(cell_para.fmts);
+                col += span;
+            }
+            max_col = max_col.max(col);
+        }
+        // Make sure the grid covers every column.
+        while (t.grid.len() as u32) < max_col {
+            t.grid.push(72.0);
+        }
+        if t.grid.is_empty() {
+            t.grid.push(72.0);
+        }
+        self.tables.insert(id, t);
+    }
+
+    fn block_children(&mut self, el: &El, out: &mut Vec<Para>, cell: Option<CellRef>, tbl_style: Option<&str>) {
+        for c in el.elems() {
+            match c.name.as_str() {
+                "p" => {
+                    let p = self.paragraph(c, cell, tbl_style);
+                    out.push(p);
+                }
+                "tbl" => self.table(c, out, cell),
+                "sdt" => {
+                    if let Some(content) = c.child("sdtContent") {
+                        self.block_children(content, out, cell, tbl_style);
+                    }
+                }
+                "customXml" => self.block_children(c, out, cell, tbl_style),
+                "tcPr" | "sectPr" => {}
+                "bookmarkStart" | "bookmarkEnd" | "commentRangeStart" | "commentRangeEnd" | "permStart"
+                | "permEnd" | "moveFromRangeStart" | "moveFromRangeEnd" | "moveToRangeStart" | "moveToRangeEnd"
+                | "proofErr" => {
+                    let id = self.obj(c.to_xml(), ObjKind::Hidden);
+                    let f = self.sheet.char_fmt(None, None);
+                    self.pending.push((id, f));
+                }
+                _ => {
+                    let mut p = Para::new(Style::Normal);
+                    p.cell = cell;
+                    p.raw_block = Some(c.to_xml());
+                    let mut f = self.sheet.char_fmt(None, None);
+                    f.color = [0x80, 0x80, 0x80, 255];
+                    for ch in format!("[{}]", c.name).chars() {
+                        push(&mut p, ch, f);
+                    }
+                    out.push(p);
+                }
             }
         }
-        out.push(row);
     }
 }
 
-fn block(el: &El, cx: &mut Ctx, out: &mut Vec<Para>, doc: &mut Document) {
-    for e in el.elems() {
-        match e.name.as_str() {
-            "p" => out.push(paragraph(e, cx)),
-            "tbl" => table(e, cx, out),
-            "sdt" | "sdtContent" | "customXml" => block(e, cx, out, doc),
-            "sectPr" => section(e, doc),
+fn collect_named<'a>(el: &'a El, name: &str, transparent: &[&str], out: &mut Vec<&'a El>) {
+    for c in el.elems() {
+        if c.name == name {
+            out.push(c);
+        } else if transparent.contains(&c.name.as_str()) {
+            collect_named(c, name, transparent, out);
+        }
+    }
+}
+
+fn vml_size(style: &str) -> Option<(f32, f32)> {
+    let mut w = None;
+    let mut h = None;
+    for part in style.split(';') {
+        let (k, v) = part.split_once(':')?;
+        let v = v.trim();
+        let num = |s: &str| -> Option<f32> {
+            if let Some(x) = s.strip_suffix("pt") {
+                x.parse().ok()
+            } else if let Some(x) = s.strip_suffix("in") {
+                x.parse::<f32>().ok().map(|v| v * 72.0)
+            } else if let Some(x) = s.strip_suffix("px") {
+                x.parse::<f32>().ok().map(|v| v * 0.75)
+            } else {
+                s.parse().ok()
+            }
+        };
+        match k.trim() {
+            "width" => w = num(v),
+            "height" => h = num(v),
             _ => {}
         }
     }
+    Some((w?, h?))
 }
 
-fn section(e: &El, doc: &mut Document) {
-    if let Some(sz) = e.child("pgSz") {
-        if let (Some(w), Some(h)) = (twips(sz, "w"), twips(sz, "h")) {
-            doc.page.width = w;
-            doc.page.height = h;
+fn sym_glyph(code: u32, font: Option<&str>) -> String {
+    let low = if (0xF000..=0xF0FF).contains(&code) { code - 0xF000 } else { code };
+    let f = font.unwrap_or("").to_ascii_lowercase();
+    let c = if f.contains("wingdings") {
+        match low {
+            0xFC => '✓',
+            0xFB => '✗',
+            0xA7 => '▪',
+            0xD8 => '➢',
+            0x6C => '●',
+            0x6E => '■',
+            0x71 => '❑',
+            0xA8 => '◆',
+            0x4A => '☺',
+            0xE0 => '→',
+            _ => '•',
         }
-    }
-    if let Some(m) = e.child("pgMar") {
-        let g = |k| twips(m, k).map(|v| v.abs());
-        doc.page.margins = [
-            g("top").unwrap_or(72.0),
-            g("right").unwrap_or(72.0),
-            g("bottom").unwrap_or(72.0),
-            g("left").unwrap_or(72.0),
-        ];
+    } else if f.contains("symbol") {
+        match low {
+            0xB7 => '•',
+            0x61 => 'α',
+            0x62 => 'β',
+            0x70 => 'π',
+            0xA5 => '∞',
+            0xB1 => '±',
+            0xB4 => '×',
+            0xB8 => '÷',
+            0xAE => '→',
+            0xD3 | 0xE3 => '©',
+            _ => char::from_u32(low).unwrap_or('•'),
+        }
+    } else {
+        char::from_u32(code).unwrap_or('•')
+    };
+    c.to_string()
+}
+
+/// Copies resolved paragraph properties into a paragraph.
+fn set_para_props(p: &mut Para, pp: &PProps, numbering: &Numbering) {
+    p.align = pp.align;
+    p.space_before = pp.before;
+    p.space_after = pp.after;
+    p.line_spacing = pp.line;
+    p.line_rule = pp.line_rule;
+    p.contextual = pp.contextual;
+    p.ind_left = pp.ind_left;
+    p.ind_right = pp.ind_right;
+    p.ind_first = pp.ind_first;
+    p.tabs = pp.tabs.clone();
+    p.shading = pp.shading;
+    p.page_break_before = pp.page_break_before;
+    p.num_id = 0;
+    p.list = ListKind::None;
+    p.level = 0;
+    if let Some((n, l)) = pp.num {
+        if let Some(level) = numbering.level(n, l) {
+            if level.fmt != crate::numbering::NumFmt::None || !level.text.is_empty() {
+                p.num_id = n;
+                p.level = l;
+                p.list = if numbering.is_bullet(n, l) { ListKind::Bullet } else { ListKind::Number };
+            }
+        }
     }
 }
 
@@ -678,12 +674,14 @@ fn hf_text(el: &El) -> (String, bool) {
                     }
                 }
                 "t" if !*in_field => out.push_str(&c.text()),
+                "tab" => out.push(' '),
                 "p" => {
-                    if !out.is_empty() {
+                    if !out.trim().is_empty() {
                         out.push(' ');
                     }
                     walk(c, out, in_field, page);
                 }
+                "drawing" | "pict" | "AlternateContent" | "sdtPr" => {}
                 _ => walk(c, out, in_field, page),
             }
         }
@@ -691,9 +689,9 @@ fn hf_text(el: &El) -> (String, bool) {
     let mut s = String::new();
     let mut page = false;
     walk(el, &mut s, &mut false, &mut page);
-    let mut t = s.trim().to_string();
+    let mut t = s.split_whitespace().collect::<Vec<_>>().join(" ");
     if page {
-        for pat in ["Page  of", "Page of", "Page"] {
+        for pat in ["Page of", "Page"] {
             if let Some(stripped) = t.strip_suffix(pat) {
                 t = stripped.trim().to_string();
                 break;
@@ -703,92 +701,1215 @@ fn hf_text(el: &El) -> (String, bool) {
     (t, page)
 }
 
-pub fn load_docx(path: &Path) -> Result<Document, String> {
-    let file = File::open(path).map_err(|e| e.to_string())?;
-    let mut zip = zip::ZipArchive::new(file).map_err(|e| format!("Not a valid .docx file: {e}"))?;
-    let root = read_xml(&mut zip, "word/document.xml").ok_or("word/document.xml is missing or invalid")?;
+/// Style sheet of a stored .docx package.
+pub fn sheet_from_parts(parts: &BTreeMap<String, Vec<u8>>) -> StyleSheet {
+    let main = read_rels(parts, "")
+        .values()
+        .find(|r| r.kind == "officeDocument")
+        .map(|r| r.target.clone())
+        .unwrap_or_else(|| "word/document.xml".into());
+    let rels = read_rels(parts, &main);
+    let part_of = |kind: &str| rels.values().find(|r| r.kind == kind).map(|r| r.target.clone());
+    let styles_el = part_of("styles").and_then(|t| part_xml(parts, &t));
+    let theme_el = part_of("theme").and_then(|t| part_xml(parts, &t));
+    StyleSheet::parse(styles_el.as_ref(), theme_el.as_ref())
+}
 
-    let mut cx = Ctx {
-        styles: HashMap::new(),
-        bullets: HashMap::new(),
-        rels: HashMap::new(),
-        media: HashMap::new(),
-        images: Vec::new(),
-        next_image: 1,
-    };
-    if let Some(styles) = read_xml(&mut zip, "word/styles.xml") {
-        for s in styles.elems().filter(|e| e.name == "style") {
-            if let Some(id) = s.attr("styleId") {
-                let name = s.child_val("name");
-                cx.styles.insert(id.to_string(), Style::from_docx(id, name));
-            }
+pub fn load_docx(path: &Path) -> Result<Document, String> {
+    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+    load_docx_bytes(&bytes)
+}
+
+pub fn load_docx_bytes(bytes: &[u8]) -> Result<Document, String> {
+    let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).map_err(|e| format!("Not a valid .docx file: {e}"))?;
+    let mut parts = BTreeMap::new();
+    for i in 0..zip.len() {
+        let mut f = zip.by_index(i).map_err(|e| e.to_string())?;
+        if f.is_dir() {
+            continue;
+        }
+        let mut v = Vec::new();
+        f.read_to_end(&mut v).map_err(|e| e.to_string())?;
+        let name = f.name().map_err(|e| e.to_string())?.to_string();
+        parts.insert(name, v);
+    }
+
+    let pkg_rels = read_rels(&parts, "");
+    let main = pkg_rels
+        .values()
+        .find(|r| r.kind == "officeDocument")
+        .map(|r| r.target.clone())
+        .unwrap_or_else(|| "word/document.xml".into());
+    let root = part_xml(&parts, &main).ok_or("The main document part is missing or invalid")?;
+    let rels = read_rels(&parts, &main);
+    let part_of = |kind: &str| rels.values().find(|r| r.kind == kind).map(|r| r.target.clone());
+
+    let styles_el = part_of("styles").and_then(|t| part_xml(&parts, &t));
+    let theme_el = part_of("theme").and_then(|t| part_xml(&parts, &t));
+    let sheet = StyleSheet::parse(styles_el.as_ref(), theme_el.as_ref());
+    let mut numbering = part_of("numbering").and_then(|t| part_xml(&parts, &t)).map(|n| Numbering::parse(&n)).unwrap_or_default();
+    // Numbering styles: abstractNum with numStyleLink points at a style whose pPr has the numId.
+    let mut style_nums = HashMap::new();
+    for (id, def) in &sheet.styles {
+        if let Some(n) = def.ppr.as_ref().and_then(|p| p.child("numPr")).and_then(|n| n.child_val("numId")).and_then(|v| v.parse().ok()) {
+            style_nums.insert(id.clone(), n);
         }
     }
-    if let Some(num) = read_xml(&mut zip, "word/numbering.xml") {
-        let mut abstract_fmt: HashMap<String, HashMap<u8, bool>> = HashMap::new();
-        for a in num.elems().filter(|e| e.name == "abstractNum") {
-            let id = a.attr("abstractNumId").unwrap_or("").to_string();
-            let mut lv = HashMap::new();
-            for l in a.elems().filter(|e| e.name == "lvl") {
-                let il: u8 = l.attr("ilvl").and_then(|v| v.parse().ok()).unwrap_or(0);
-                lv.insert(il, l.child_val("numFmt") == Some("bullet"));
-            }
-            abstract_fmt.insert(id, lv);
-        }
-        for n in num.elems().filter(|e| e.name == "num") {
-            let nid = n.attr("numId").unwrap_or("").to_string();
-            let aid = n.child_val("abstractNumId").unwrap_or("").to_string();
-            if let Some(lv) = abstract_fmt.get(&aid) {
-                for (il, b) in lv {
-                    cx.bullets.insert((nid.clone(), *il), *b);
-                }
-            }
-        }
-    }
-    if let Some(rels) = read_xml(&mut zip, "word/_rels/document.xml.rels") {
-        for r in rels.elems() {
-            if let (Some(id), Some(t)) = (r.attr("Id"), r.attr("Target")) {
-                let target = if let Some(abs) = t.strip_prefix('/') { abs.to_string() } else { format!("word/{t}") };
-                cx.rels.insert(id.to_string(), target);
-            }
-        }
-    }
-    let names: Vec<String> = cx.rels.values().filter(|t| t.contains("media/")).cloned().collect();
-    for n in names {
-        if let Some(b) = read_entry(&mut zip, &n) {
-            cx.media.insert(n, b);
-        }
-    }
+    numbering.resolve_style_links(&style_nums);
 
     let mut doc = Document::new();
+    let pkg_id = pool::new_pkg_id();
+    if let Some(settings) = part_of("settings").and_then(|t| part_xml(&parts, &t)) {
+        if let Some(v) = settings.child("defaultTabStop").and_then(|e| twips_attr(e, "val")) {
+            if v > 1.0 {
+                doc.page.default_tab = v;
+            }
+        }
+    }
+
+    let mut reader = Reader {
+        parts: &parts,
+        rels,
+        sheet: &sheet,
+        numbering: &numbering,
+        pkg: pkg_id,
+        images: BTreeMap::new(),
+        tables: BTreeMap::new(),
+        pending: Vec::new(),
+    };
     let mut paras = Vec::new();
-    if let Some(body) = root.child("body") {
-        block(body, &mut cx, &mut paras, &mut doc);
-        if let Some(sect) = body.child("sectPr") {
-            for (tag, is_header) in [("headerReference", true), ("footerReference", false)] {
-                let r = sect
-                    .elems()
-                    .filter(|e| e.name == tag)
-                    .find(|e| e.attr("type") == Some("default"))
-                    .and_then(|e| e.attr("id"))
-                    .and_then(|id| cx.rels.get(id).cloned());
-                if let Some(part) = r.and_then(|t| read_xml(&mut zip, &t)) {
-                    let (text, page) = hf_text(&part);
-                    if is_header {
-                        doc.header = text;
-                    } else {
-                        doc.footer = text;
+    let body = root.child("body");
+    if let Some(body) = body {
+        reader.block_children(body, &mut paras, None, None);
+    }
+    // Inline objects after the last paragraph go into a final paragraph.
+    if !reader.pending.is_empty() {
+        let mut p = Para::new(Style::Normal);
+        p.style_id = sheet.default_para.clone();
+        for (id, f) in std::mem::take(&mut reader.pending) {
+            let mut of = f;
+            of.obj = id;
+            push(&mut p, OBJ, of);
+        }
+        paras.push(p);
+    }
+    let images = std::mem::take(&mut reader.images);
+    let tables = std::mem::take(&mut reader.tables);
+    let rels = std::mem::take(&mut reader.rels);
+
+    let mut pkg = Package {
+        id: pkg_id,
+        root_attrs: root.attrs.clone(),
+        background: root.child("background").map(|b| b.to_xml()),
+        ..Default::default()
+    };
+    if let Some(sect) = body.and_then(|b| b.child("sectPr")) {
+        read_section(sect, &mut doc.page);
+        pkg.body_sect = Some(sect.to_xml());
+        for (tag, is_header) in [("headerReference", true), ("footerReference", false)] {
+            let part = sect
+                .elems()
+                .filter(|e| e.name == tag)
+                .find(|e| e.attr("type") == Some("default"))
+                .and_then(|e| e.attr("id"))
+                .and_then(|id| rels.get(id))
+                .and_then(|r| part_xml(&parts, &r.target));
+            if let Some(part) = part {
+                let (text, page) = hf_text(&part);
+                if is_header {
+                    doc.header = text;
+                } else {
+                    doc.footer = text;
+                }
+                doc.page_numbers |= page;
+            }
+        }
+    }
+    pkg.header_text = doc.header.clone();
+    pkg.footer_text = doc.footer.clone();
+    pkg.page_numbers = doc.page_numbers;
+    pkg.parts = parts;
+
+    doc.images = images;
+    doc.tables = tables;
+    doc.numbering = numbering;
+    doc.styles = Arc::new(sheet);
+    doc.pkg = Some(Arc::new(pkg));
+    if !paras.is_empty() {
+        doc.paras = paras;
+    } else {
+        doc.paras[0].style_id = doc.styles.default_para.clone();
+    }
+    doc.ensure_trailing_para();
+    Ok(doc)
+}
+
+fn read_section(e: &El, page: &mut PageSetup) {
+    if let Some(sz) = e.child("pgSz") {
+        if let (Some(w), Some(h)) = (twips_attr(sz, "w"), twips_attr(sz, "h")) {
+            page.width = w.max(72.0);
+            page.height = h.max(72.0);
+        }
+    }
+    if let Some(m) = e.child("pgMar") {
+        let g = |k| twips_attr(m, k).map(|v| v.abs());
+        page.margins = [
+            g("top").unwrap_or(72.0),
+            g("right").unwrap_or(72.0),
+            g("bottom").unwrap_or(72.0),
+            g("left").unwrap_or(72.0),
+        ];
+        page.header_dist = g("header").unwrap_or(36.0);
+        page.footer_dist = g("footer").unwrap_or(36.0);
+    }
+}
+
+// ================================================================ export
+
+/// styles.xml for documents created in FreeWord.
+pub fn default_styles_xml() -> String {
+    let font = esc(fonts::default_font());
+    let mut s = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<w:styles xmlns:w=\"{W_NS}\">\
+<w:docDefaults><w:rPrDefault><w:rPr><w:rFonts w:ascii=\"{font}\" w:hAnsi=\"{font}\" w:eastAsia=\"{font}\" w:cs=\"{font}\"/><w:sz w:val=\"22\"/><w:szCs w:val=\"22\"/><w:lang w:val=\"en-US\" w:eastAsia=\"en-US\" w:bidi=\"ar-SA\"/></w:rPr></w:rPrDefault>\
+<w:pPrDefault><w:pPr><w:spacing w:after=\"160\" w:line=\"276\" w:lineRule=\"auto\"/></w:pPr></w:pPrDefault></w:docDefaults>"
+    );
+    for st in Style::ALL {
+        s.push_str(&builtin_style_xml(st));
+    }
+    s.push_str(
+        "<w:style w:type=\"character\" w:default=\"1\" w:styleId=\"DefaultParagraphFont\"><w:name w:val=\"Default Paragraph Font\"/><w:uiPriority w:val=\"1\"/><w:semiHidden/><w:unhideWhenUsed/></w:style>\
+<w:style w:type=\"character\" w:styleId=\"Hyperlink\"><w:name w:val=\"Hyperlink\"/><w:basedOn w:val=\"DefaultParagraphFont\"/><w:uiPriority w:val=\"99\"/><w:unhideWhenUsed/><w:rPr><w:color w:val=\"0563C1\"/><w:u w:val=\"single\"/></w:rPr></w:style>\
+<w:style w:type=\"table\" w:default=\"1\" w:styleId=\"TableNormal\"><w:name w:val=\"Normal Table\"/><w:uiPriority w:val=\"99\"/><w:semiHidden/><w:unhideWhenUsed/><w:tblPr><w:tblInd w:w=\"0\" w:type=\"dxa\"/><w:tblCellMar><w:top w:w=\"0\" w:type=\"dxa\"/><w:left w:w=\"108\" w:type=\"dxa\"/><w:bottom w:w=\"0\" w:type=\"dxa\"/><w:right w:w=\"108\" w:type=\"dxa\"/></w:tblCellMar></w:tblPr></w:style>\
+<w:style w:type=\"table\" w:styleId=\"TableGrid\"><w:name w:val=\"Table Grid\"/><w:basedOn w:val=\"TableNormal\"/><w:uiPriority w:val=\"39\"/><w:pPr><w:spacing w:after=\"0\" w:line=\"240\" w:lineRule=\"auto\"/></w:pPr><w:tblPr><w:tblBorders><w:top w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/><w:left w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/><w:bottom w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/><w:right w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/><w:insideH w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/><w:insideV w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/></w:tblBorders></w:tblPr></w:style>\
+<w:style w:type=\"numbering\" w:default=\"1\" w:styleId=\"NoList\"><w:name w:val=\"No List\"/><w:uiPriority w:val=\"99\"/><w:semiHidden/><w:unhideWhenUsed/></w:style>",
+    );
+    s.push_str("</w:styles>");
+    s
+}
+
+fn builtin_style_xml(st: Style) -> String {
+    let f = st.char_fmt();
+    let base = Style::Normal.char_fmt();
+    let (b, a) = st.spacing();
+    let mut ppr = format!(
+        "<w:pPr><w:spacing w:before=\"{}\" w:after=\"{}\" w:line=\"{}\" w:lineRule=\"auto\"/>",
+        tw(b),
+        tw(a),
+        (st.line_spacing() * 240.0).round() as i32
+    );
+    if st == Style::Quote {
+        ppr.push_str("<w:ind w:left=\"720\" w:right=\"720\"/>");
+    }
+    if st == Style::Code {
+        ppr.push_str("<w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"F3F3F3\"/>");
+    }
+    let outline = match st {
+        Style::Heading1 => Some(0),
+        Style::Heading2 => Some(1),
+        Style::Heading3 => Some(2),
+        _ => None,
+    };
+    if st.next_is_normal() {
+        ppr.insert_str("<w:pPr>".len(), "<w:keepNext/><w:keepLines/>");
+    }
+    if let Some(o) = outline {
+        ppr.push_str(&format!("<w:outlineLvl w:val=\"{o}\"/>"));
+    }
+    ppr.push_str("</w:pPr>");
+    let name = match st {
+        Style::Heading1 => "heading 1",
+        Style::Heading2 => "heading 2",
+        Style::Heading3 => "heading 3",
+        s => s.name(),
+    };
+    let default = if st == Style::Normal { " w:default=\"1\"" } else { "" };
+    let based = if st == Style::Normal {
+        "<w:qFormat/>".to_string()
+    } else {
+        "<w:basedOn w:val=\"Normal\"/><w:next w:val=\"Normal\"/><w:qFormat/>".to_string()
+    };
+    let rpr = rpr_diff(&f, &base, 0, &mut DiffCache::default());
+    format!(
+        "<w:style w:type=\"paragraph\"{default} w:styleId=\"{}\"><w:name w:val=\"{name}\"/>{based}{ppr}{rpr}</w:style>",
+        st.docx_id()
+    )
+}
+
+#[derive(Default)]
+struct DiffCache {
+    extras: HashMap<u32, Vec<El>>,
+}
+
+impl DiffCache {
+    fn extras(&mut self, id: u32) -> &Vec<El> {
+        self.extras.entry(id).or_insert_with(|| xml::parse_elems(&pool::get(id)))
+    }
+}
+
+fn highlight_xml(c: crate::doc::Rgba) -> (String, String) {
+    if c[3] == 0 {
+        return ("highlight".into(), "<w:highlight w:val=\"none\"/>".into());
+    }
+    match HIGHLIGHTS.iter().find(|(_, h)| h[..3] == c[..3]) {
+        Some((name, _)) => ("highlight".into(), format!("<w:highlight w:val=\"{name}\"/>")),
+        None => ("shd".into(), format!("<w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"{}\"/>", hex(c))),
+    }
+}
+
+/// `w:rPr` holding the differences between `f` and `base`, plus raw extras.
+fn rpr_diff(f: &CharFmt, base: &CharFmt, extra: u32, cache: &mut DiffCache) -> String {
+    let mut items: Vec<(String, String)> = Vec::new();
+    let toggle = |items: &mut Vec<(String, String)>, name: &str, on: bool, base_on: bool| {
+        if on != base_on {
+            let v = if on { String::new() } else { " w:val=\"0\"".into() };
+            items.push((name.into(), format!("<w:{name}{v}/>")));
+        }
+    };
+    if f.font != base.font {
+        let n = esc(&fonts::font_name(f.font));
+        items.push(("rFonts".into(), format!("<w:rFonts w:ascii=\"{n}\" w:hAnsi=\"{n}\" w:eastAsia=\"{n}\" w:cs=\"{n}\"/>")));
+    }
+    toggle(&mut items, "b", f.bold, base.bold);
+    toggle(&mut items, "bCs", f.bold, base.bold);
+    toggle(&mut items, "i", f.italic, base.italic);
+    toggle(&mut items, "iCs", f.italic, base.italic);
+    toggle(&mut items, "caps", f.caps, base.caps);
+    toggle(&mut items, "smallCaps", f.small_caps, base.small_caps);
+    toggle(&mut items, "strike", f.strike, base.strike);
+    toggle(&mut items, "vanish", f.hidden, base.hidden);
+    if f.color != base.color {
+        items.push(("color".into(), format!("<w:color w:val=\"{}\"/>", hex(f.color))));
+    }
+    if (f.char_spacing - base.char_spacing).abs() > 0.01 {
+        items.push(("spacing".into(), format!("<w:spacing w:val=\"{}\"/>", tw(f.char_spacing))));
+    }
+    if (f.size - base.size).abs() > 0.01 {
+        let hp = (f.size * 2.0).round() as i32;
+        items.push(("sz".into(), format!("<w:sz w:val=\"{hp}\"/>")));
+        items.push(("szCs".into(), format!("<w:szCs w:val=\"{hp}\"/>")));
+    }
+    if f.highlight != base.highlight {
+        items.push(highlight_xml(f.highlight));
+    }
+    let extras = if extra != 0 { cache.extras(extra).clone() } else { Vec::new() };
+    let fancy_u = extras.iter().any(|e| e.name == "u");
+    if f.underline != base.underline || (fancy_u && !f.underline) {
+        if !(fancy_u && f.underline) {
+            let v = if f.underline { "single" } else { "none" };
+            items.push(("u".into(), format!("<w:u w:val=\"{v}\"/>")));
+        }
+    }
+    if f.script != base.script {
+        let v = match f.script {
+            1 => "superscript",
+            -1 => "subscript",
+            _ => "baseline",
+        };
+        items.push(("vertAlign".into(), format!("<w:vertAlign w:val=\"{v}\"/>")));
+    }
+    let written: HashSet<String> = items.iter().map(|(n, _)| n.clone()).collect();
+    for e in extras {
+        if e.name == "u" && !f.underline {
+            continue;
+        }
+        if e.name == "color" && f.color != base.color {
+            continue;
+        }
+        if !written.contains(&e.name) {
+            items.push((e.name.clone(), e.to_xml()));
+        }
+    }
+    if items.is_empty() {
+        return String::new();
+    }
+    format!("<w:rPr>{}</w:rPr>", ordered(RPR_ORDER, items))
+}
+
+struct Writer<'a> {
+    doc: &'a Document,
+    pkg_id: u64,
+    cache: DiffCache,
+    /// New relationships: (id, type, target, external).
+    rels: Vec<(String, String, String, bool)>,
+    link_rels: HashMap<String, String>,
+    image_rels: HashMap<u32, String>,
+    media: Vec<(String, Arc<Vec<u8>>)>,
+    doc_pr_id: u32,
+    /// (paragraph, char) of field markers to drop because they are unbalanced.
+    drop_markers: HashSet<(usize, usize)>,
+    /// Existing rel ids, to avoid collisions.
+    used_rel_ids: HashSet<String>,
+}
+
+impl Writer<'_> {
+    fn new_rel(&mut self, kind: &str, target: &str, external: bool) -> String {
+        let mut n = self.rels.len() + 1;
+        let mut id = format!("rIdFw{n}");
+        while self.used_rel_ids.contains(&id) {
+            n += 1;
+            id = format!("rIdFw{n}");
+        }
+        self.used_rel_ids.insert(id.clone());
+        self.rels.push((id.clone(), format!("{REL_T}/{kind}"), target.to_string(), external));
+        id
+    }
+
+    fn link_rel(&mut self, url: &str) -> String {
+        if let Some(id) = self.link_rels.get(url) {
+            return id.clone();
+        }
+        let id = self.new_rel("hyperlink", url, true);
+        self.link_rels.insert(url.to_string(), id.clone());
+        id
+    }
+
+    fn image_rel(&mut self, image: u32) -> String {
+        if let Some(id) = self.image_rels.get(&image) {
+            return id.clone();
+        }
+        let img = &self.doc.images[&image];
+        let (ext, _) = image_kind(&img.bytes);
+        let name = format!("media/fw_image{image}.{ext}");
+        self.media.push((format!("word/{name}"), img.bytes.clone()));
+        let id = self.new_rel("image", &name, false);
+        self.image_rels.insert(image, id.clone());
+        id
+    }
+
+    /// Finds unbalanced field markers across the whole document.
+    fn balance_fields(&mut self) {
+        let mut stack: Vec<((usize, usize), bool)> = Vec::new(); // (pos, has separator)
+        let mut seps: Vec<(usize, usize)> = Vec::new();
+        let mut drop = HashSet::new();
+        for (pi, p) in self.doc.paras.iter().enumerate() {
+            // Wrappers (tracked insertions) must open and close within a paragraph.
+            let mut wraps: Vec<usize> = Vec::new();
+            for (ci, f) in p.fmts.iter().enumerate() {
+                let Some(o) = pool::obj(f.obj) else { continue };
+                if !self.obj_allowed(&o) {
+                    continue;
+                }
+                match o.kind {
+                    ObjKind::Wrap { open: true } => wraps.push(ci),
+                    ObjKind::Wrap { open: false } => {
+                        if wraps.pop().is_none() {
+                            drop.insert((pi, ci));
+                        }
                     }
-                    doc.page_numbers |= page;
+                    ObjKind::FieldBegin => stack.push(((pi, ci), false)),
+                    ObjKind::FieldSep => {
+                        if let Some(top) = stack.last_mut() {
+                            if top.1 {
+                                drop.insert((pi, ci));
+                            } else {
+                                top.1 = true;
+                                seps.push((pi, ci));
+                            }
+                        } else {
+                            drop.insert((pi, ci));
+                        }
+                    }
+                    ObjKind::FieldEnd => {
+                        if stack.pop().is_none() {
+                            drop.insert((pi, ci));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            for ci in wraps {
+                drop.insert((pi, ci));
+            }
+        }
+        // An unterminated field drops its begin marker and its separator.
+        for ((pi, ci), has_sep) in stack {
+            drop.insert((pi, ci));
+            if has_sep {
+                if let Some(s) = seps.iter().find(|s| **s > (pi, ci)) {
+                    drop.insert(*s);
+                }
+            }
+        }
+        self.drop_markers = drop;
+    }
+
+    fn obj_allowed(&self, o: &RawObj) -> bool {
+        if o.pkg == self.pkg_id {
+            return true;
+        }
+        // Content from another package: only self-contained markup survives.
+        match &o.kind {
+            ObjKind::FieldBegin | ObjKind::FieldSep | ObjKind::FieldEnd | ObjKind::Wrap { .. } => true,
+            ObjKind::Label(_) => !pool::has_rel_refs(&o.xml),
+            ObjKind::Hidden => o.xml.contains("instrText") && !pool::has_rel_refs(&o.xml),
+            _ => false,
+        }
+    }
+
+    fn base_for(&mut self, p: &Para, extra: u32) -> CharFmt {
+        let rstyle = if extra != 0 {
+            self.cache.extras(extra).iter().find(|e| e.name == "rStyle").and_then(|e| e.attr("val").map(|s| s.to_string()))
+        } else {
+            None
+        };
+        let pstyle = self.style_for_write(p);
+        self.doc.styles.char_fmt(pstyle.as_deref(), rstyle.as_deref())
+    }
+
+    /// Style id written for a paragraph (only ids the style sheet knows).
+    fn style_for_write(&self, p: &Para) -> Option<String> {
+        let id = match &p.style_id {
+            Some(id) => Some(id.clone()),
+            None if p.style != Style::Normal => self
+                .doc
+                .styles
+                .id_for_name(p.style.name())
+                .or_else(|| Some(p.style.docx_id().to_string())),
+            None => None,
+        };
+        id.filter(|id| self.doc.styles.styles.contains_key(id))
+    }
+
+    fn para_xml(&mut self, pi: usize, out: &mut String) {
+        let p = &self.doc.paras[pi];
+        if let Some(raw) = &p.raw_block {
+            out.push_str(raw);
+            return;
+        }
+        let doc = self.doc;
+        let style = self.style_for_write(p);
+        let base = doc.styles.para_props(style.as_deref(), &doc.numbering);
+        let mut items: Vec<(String, String)> = Vec::new();
+        if let Some(s) = &style {
+            if Some(s) != doc.styles.default_para.as_ref() {
+                items.push(("pStyle".into(), format!("<w:pStyle w:val=\"{}\"/>", esc(s))));
+            }
+        }
+        // Numbering.
+        let ours = (p.list != ListKind::None && p.num_id != 0 && doc.numbering.nums.contains_key(&p.num_id)).then_some((p.num_id, p.level));
+        let mut ind_base = base.clone();
+        if ours != base.num {
+            match ours {
+                Some((n, l)) => {
+                    items.push(("numPr".into(), format!("<w:numPr><w:ilvl w:val=\"{l}\"/><w:numId w:val=\"{n}\"/></w:numPr>")));
+                    if let Some(lv) = doc.numbering.level(n, l) {
+                        ind_base.ind_left = lv.left;
+                        ind_base.ind_first = -lv.hanging;
+                    }
+                }
+                None => items.push(("numPr".into(), "<w:numPr><w:ilvl w:val=\"0\"/><w:numId w:val=\"0\"/></w:numPr>".into())),
+            }
+        }
+        if (p.space_before - base.before).abs() > 0.01
+            || (p.space_after - base.after).abs() > 0.01
+            || (p.line_spacing - base.line).abs() > 0.001
+            || p.line_rule != base.line_rule
+        {
+            let (line, rule) = match p.line_rule {
+                LineRule::Auto => ((p.line_spacing * 240.0).round() as i32, "auto"),
+                LineRule::AtLeast => (tw(p.line_spacing), "atLeast"),
+                LineRule::Exact => (tw(p.line_spacing), "exact"),
+            };
+            items.push((
+                "spacing".into(),
+                format!(
+                    "<w:spacing w:before=\"{}\" w:after=\"{}\" w:line=\"{line}\" w:lineRule=\"{rule}\"/>",
+                    tw(p.space_before),
+                    tw(p.space_after)
+                ),
+            ));
+        }
+        if (p.ind_left - ind_base.ind_left).abs() > 0.01
+            || (p.ind_right - ind_base.ind_right).abs() > 0.01
+            || (p.ind_first - ind_base.ind_first).abs() > 0.01
+        {
+            let first = if p.ind_first < 0.0 {
+                format!(" w:hanging=\"{}\"", tw(-p.ind_first))
+            } else {
+                format!(" w:firstLine=\"{}\"", tw(p.ind_first))
+            };
+            items.push((
+                "ind".into(),
+                format!("<w:ind w:left=\"{}\" w:right=\"{}\"{first}/>", tw(p.ind_left), tw(p.ind_right)),
+            ));
+        }
+        if p.align != base.align {
+            let v = match p.align {
+                Align::Left => "left",
+                Align::Center => "center",
+                Align::Right => "right",
+                Align::Justify => "both",
+            };
+            items.push(("jc".into(), format!("<w:jc w:val=\"{v}\"/>")));
+        }
+        if p.contextual != base.contextual {
+            items.push(("contextualSpacing".into(), format!("<w:contextualSpacing w:val=\"{}\"/>", p.contextual as u8)));
+        }
+        if p.page_break_before != base.page_break_before {
+            items.push(("pageBreakBefore".into(), format!("<w:pageBreakBefore w:val=\"{}\"/>", p.page_break_before as u8)));
+        }
+        if p.shading != base.shading {
+            let fill = if p.shading[3] == 0 { "auto".to_string() } else { hex(p.shading) };
+            items.push(("shd".into(), format!("<w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"{fill}\"/>")));
+        }
+        if p.tabs != base.tabs {
+            let mut t = String::from("<w:tabs>");
+            for b in &base.tabs {
+                if !p.tabs.iter().any(|x| (x.pos - b.pos).abs() < 0.5) {
+                    t.push_str(&format!("<w:tab w:val=\"clear\" w:pos=\"{}\"/>", tw(b.pos)));
+                }
+            }
+            for x in &p.tabs {
+                t.push_str(&tab_xml(x));
+            }
+            t.push_str("</w:tabs>");
+            if t != "<w:tabs></w:tabs>" {
+                items.push(("tabs".into(), t));
+            }
+        }
+        let mark_base = self.base_for(p, p.end_fmt.rpr_extra);
+        let mark = rpr_diff(&p.end_fmt, &mark_base, p.end_fmt.rpr_extra, &mut self.cache);
+        if !mark.is_empty() {
+            items.push(("rPr".into(), mark));
+        }
+        let written: HashSet<String> = items.iter().map(|(n, _)| n.clone()).collect();
+        for e in xml::parse_elems(&p.ppr_extra) {
+            if !written.contains(&e.name) {
+                if e.name == "sectPr" && !p.sect_break {
+                    continue;
+                }
+                items.push((e.name.clone(), e.to_xml()));
+            }
+        }
+        out.push_str("<w:p>");
+        if !items.is_empty() {
+            out.push_str("<w:pPr>");
+            out.push_str(&ordered(PPR_ORDER, items));
+            out.push_str("</w:pPr>");
+        }
+        self.runs_xml(pi, out);
+        out.push_str("</w:p>");
+    }
+
+    fn runs_xml(&mut self, pi: usize, out: &mut String) {
+        let doc = self.doc;
+        let p = &doc.paras[pi];
+        let mut i = 0;
+        let mut open_link = 0u32;
+        while i < p.chars.len() {
+            let f = p.fmts[i];
+            // Hyperlink wrapper.
+            if f.link != open_link {
+                if open_link != 0 {
+                    out.push_str("</w:hyperlink>");
+                }
+                open_link = f.link;
+                if open_link != 0 {
+                    let (url, anchor) = pool::link(open_link);
+                    let mut attrs = String::new();
+                    if !url.is_empty() {
+                        let id = self.link_rel(&url);
+                        attrs.push_str(&format!(" r:id=\"{id}\""));
+                    }
+                    if !anchor.is_empty() {
+                        attrs.push_str(&format!(" w:anchor=\"{}\"", esc(&anchor)));
+                    }
+                    out.push_str(&format!("<w:hyperlink{attrs} w:history=\"1\">"));
+                }
+            }
+            if f.image != 0 {
+                self.image_xml(f.image, &f, p, out);
+                i += 1;
+                continue;
+            }
+            if f.obj != 0 {
+                if let Some(o) = pool::obj(f.obj) {
+                    if self.obj_allowed(&o) && !self.drop_markers.contains(&(pi, i)) {
+                        // Paragraph-level objects (bookmarks, ins/del...) must not sit inside a hyperlink.
+                        let paragraph_level = !o.xml.starts_with("<w:r>") && !o.xml.starts_with("<w:r ");
+                        if paragraph_level && open_link != 0 {
+                            out.push_str("</w:hyperlink>");
+                            out.push_str(&o.xml);
+                            open_link = 0;
+                        } else {
+                            out.push_str(&o.xml);
+                        }
+                    }
+                }
+                i += 1;
+                continue;
+            }
+            let mut j = i + 1;
+            while j < p.chars.len() && p.fmts[j] == f {
+                j += 1;
+            }
+            let base = self.base_for(p, f.rpr_extra);
+            let rpr = rpr_diff(&f, &base, f.rpr_extra, &mut self.cache);
+            out.push_str("<w:r>");
+            out.push_str(&rpr);
+            let mut buf = String::new();
+            let flush = |buf: &mut String, out: &mut String| {
+                if !buf.is_empty() {
+                    out.push_str(&format!("<w:t xml:space=\"preserve\">{}</w:t>", esc_text(buf)));
+                    buf.clear();
+                }
+            };
+            for &c in &p.chars[i..j] {
+                let special = match c {
+                    '\t' => Some("<w:tab/>"),
+                    LINE_BREAK => Some("<w:br/>"),
+                    PAGE_BREAK => Some("<w:br w:type=\"page\"/>"),
+                    COLUMN_BREAK => Some("<w:br w:type=\"column\"/>"),
+                    NBH => Some("<w:noBreakHyphen/>"),
+                    SHY => Some("<w:softHyphen/>"),
+                    OBJ => Some(""),
+                    _ => None,
+                };
+                match special {
+                    Some(x) => {
+                        flush(&mut buf, out);
+                        out.push_str(x);
+                    }
+                    None => buf.push(c),
+                }
+            }
+            flush(&mut buf, out);
+            out.push_str("</w:r>");
+            i = j;
+        }
+        if open_link != 0 {
+            out.push_str("</w:hyperlink>");
+        }
+    }
+
+    fn image_xml(&mut self, image: u32, f: &CharFmt, p: &Para, out: &mut String) {
+        let Some(img) = self.doc.images.get(&image) else { return };
+        let (w, h) = (img.w, img.h);
+        let raw = img.raw.clone();
+        let rel = self.image_rel(image);
+        let cx = (w * 12700.0) as i64;
+        let cy = (h * 12700.0) as i64;
+        if let Some((raw, pkg)) = raw {
+            if pkg == self.pkg_id || !raw.contains(" r:id=") {
+                if let Ok(mut el) = xml::parse(&raw) {
+                    patch_drawing(&mut el, &rel, cx, cy);
+                    out.push_str(&el.to_xml());
+                    return;
+                }
+            }
+        }
+        self.doc_pr_id += 1;
+        let n = self.doc_pr_id;
+        let base = self.base_for(p, f.rpr_extra);
+        let mut plain = *f;
+        plain.image = 0;
+        let rpr = rpr_diff(&plain, &base, f.rpr_extra, &mut self.cache);
+        out.push_str(&format!(
+            "<w:r>{rpr}<w:drawing><wp:inline distT=\"0\" distB=\"0\" distL=\"0\" distR=\"0\">\
+<wp:extent cx=\"{cx}\" cy=\"{cy}\"/><wp:effectExtent l=\"0\" t=\"0\" r=\"0\" b=\"0\"/><wp:docPr id=\"{id}\" name=\"Picture {n}\"/>\
+<wp:cNvGraphicFramePr><a:graphicFrameLocks xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" noChangeAspect=\"1\"/></wp:cNvGraphicFramePr>\
+<a:graphic xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\"><a:graphicData uri=\"http://schemas.openxmlformats.org/drawingml/2006/picture\">\
+<pic:pic xmlns:pic=\"http://schemas.openxmlformats.org/drawingml/2006/picture\"><pic:nvPicPr><pic:cNvPr id=\"{n}\" name=\"image{n}\"/><pic:cNvPicPr/></pic:nvPicPr>\
+<pic:blipFill><a:blip r:embed=\"{rel}\"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill>\
+<pic:spPr><a:xfrm><a:off x=\"0\" y=\"0\"/><a:ext cx=\"{cx}\" cy=\"{cy}\"/></a:xfrm>\
+<a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom></pic:spPr></pic:pic></a:graphicData></a:graphic>\
+</wp:inline></w:drawing></w:r>",
+            id = 60000 + n
+        ));
+    }
+
+    fn table_xml(&mut self, table: u32, range: std::ops::Range<usize>, out: &mut String) {
+        let doc = self.doc;
+        let Some(t) = doc.tables.get(&table) else {
+            for pi in range {
+                self.para_xml(pi, out);
+            }
+            return;
+        };
+        out.push_str("<w:tbl>");
+        match &t.tblpr_raw {
+            Some(raw) => out.push_str(raw),
+            None => {
+                let style = if doc.styles.styles.contains_key("TableGrid") && t.borders {
+                    "<w:tblStyle w:val=\"TableGrid\"/>".to_string()
+                } else {
+                    String::new()
+                };
+                let borders = if t.borders && style.is_empty() {
+                    "<w:tblBorders><w:top w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/><w:left w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/><w:bottom w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/><w:right w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/><w:insideH w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/><w:insideV w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/></w:tblBorders>"
+                } else {
+                    ""
+                };
+                out.push_str(&format!(
+                    "<w:tblPr>{style}<w:tblW w:w=\"0\" w:type=\"auto\"/>{borders}<w:tblLook w:val=\"04A0\" w:firstRow=\"1\" w:lastRow=\"0\" w:firstColumn=\"1\" w:lastColumn=\"0\" w:noHBand=\"0\" w:noVBand=\"1\"/></w:tblPr>"
+                ));
+            }
+        }
+        out.push_str("<w:tblGrid>");
+        for g in &t.grid {
+            out.push_str(&format!("<w:gridCol w:w=\"{}\"/>", tw(*g)));
+        }
+        out.push_str("</w:tblGrid>");
+        // Group paragraphs into rows and cells.
+        let mut i = range.start;
+        while i < range.end {
+            let row = doc.paras[i].cell.unwrap().row;
+            let rp = t.rows.get(&row).cloned().unwrap_or_default();
+            out.push_str("<w:tr>");
+            match &rp.trpr_raw {
+                Some(raw) => out.push_str(raw),
+                None if rp.height > 0.0 => out.push_str(&format!(
+                    "<w:trPr><w:trHeight w:val=\"{}\"{}/></w:trPr>",
+                    tw(rp.height),
+                    if rp.exact { " w:hRule=\"exact\"" } else { "" }
+                )),
+                None => {}
+            }
+            while i < range.end && doc.paras[i].cell.unwrap().row == row {
+                let cref = doc.paras[i].cell.unwrap();
+                let cp = t.cell(cref.row, cref.col);
+                let width: f32 = t.grid.iter().skip(cref.col as usize).take(cp.span.max(1) as usize).sum();
+                out.push_str("<w:tc>");
+                out.push_str(&tcpr_xml(&cp, width));
+                let mut last_was_para = false;
+                while i < range.end && doc.paras[i].cell == Some(cref) {
+                    last_was_para = doc.paras[i].raw_block.is_none();
+                    self.para_xml(i, out);
+                    i += 1;
+                }
+                if !last_was_para {
+                    out.push_str("<w:p/>");
+                }
+                out.push_str("</w:tc>");
+            }
+            out.push_str("</w:tr>");
+        }
+        out.push_str("</w:tbl>");
+    }
+}
+
+fn tab_xml(t: &TabStop) -> String {
+    let val = match t.kind {
+        TabKind::Left => "left",
+        TabKind::Center => "center",
+        TabKind::Right => "right",
+        TabKind::Decimal => "decimal",
+        TabKind::Bar => "bar",
+        TabKind::Clear => "clear",
+    };
+    let leader = match t.leader {
+        Leader::None => "",
+        Leader::Dot => " w:leader=\"dot\"",
+        Leader::Hyphen => " w:leader=\"hyphen\"",
+        Leader::Underscore => " w:leader=\"underscore\"",
+    };
+    format!("<w:tab w:val=\"{val}\"{leader} w:pos=\"{}\"/>", tw(t.pos))
+}
+
+fn tcpr_xml(cp: &CellProps, width: f32) -> String {
+    let mut items: Vec<(String, String)> = Vec::new();
+    items.push(("tcW".into(), format!("<w:tcW w:w=\"{}\" w:type=\"dxa\"/>", tw(width))));
+    if cp.span > 1 {
+        items.push(("gridSpan".into(), format!("<w:gridSpan w:val=\"{}\"/>", cp.span)));
+    }
+    match cp.vmerge {
+        VMerge::Restart => items.push(("vMerge".into(), "<w:vMerge w:val=\"restart\"/>".into())),
+        VMerge::Continue => items.push(("vMerge".into(), "<w:vMerge/>".into())),
+        VMerge::None => {}
+    }
+    if let Some(c) = cp.shade {
+        items.push(("shd".into(), format!("<w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"{}\"/>", hex(c))));
+    }
+    if let Some(raw) = &cp.tcpr_raw {
+        if let Ok(el) = xml::parse(raw) {
+            for e in el.elems() {
+                if !matches!(e.name.as_str(), "tcW" | "gridSpan" | "vMerge" | "shd" | "hMerge") {
+                    items.push((e.name.clone(), e.to_xml()));
                 }
             }
         }
     }
-    for (id, img) in cx.images {
-        doc.images.insert(id, img);
+    format!("<w:tcPr>{}</w:tcPr>", ordered(TCPR_ORDER, items))
+}
+
+/// Points a drawing's picture at a new relationship and updates its size.
+fn patch_drawing(el: &mut El, rel: &str, cx: i64, cy: i64) {
+    for c in el.elems_mut() {
+        match c.name.as_str() {
+            "blip" => {
+                if c.attrs.iter().any(|(k, _)| k.ends_with(":embed")) {
+                    let key = c.attrs.iter().find(|(k, _)| k.ends_with(":embed")).unwrap().0.clone();
+                    c.set_attr(&key, rel);
+                }
+            }
+            "imagedata" => {
+                if let Some(key) = c.attrs.iter().find(|(k, _)| k.ends_with(":id")).map(|(k, _)| k.clone()) {
+                    c.set_attr(&key, rel);
+                }
+            }
+            "extent" | "ext" => {
+                if c.attr("cx").is_some() && c.attr("cy").is_some() {
+                    c.set_attr("cx", &cx.to_string());
+                    c.set_attr("cy", &cy.to_string());
+                }
+            }
+            _ => {}
+        }
+        patch_drawing(c, rel, cx, cy);
     }
-    if !paras.is_empty() {
-        doc.paras = paras;
+}
+
+fn hf_xml(tag: &str, text: &str, page_numbers: bool) -> String {
+    let mut s = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<w:{tag} xmlns:w=\"{W_NS}\" xmlns:r=\"{R_NS}\"><w:p><w:pPr><w:jc w:val=\"center\"/></w:pPr>"
+    );
+    let gray = "<w:rPr><w:color w:val=\"595959\"/><w:sz w:val=\"20\"/></w:rPr>";
+    if !text.is_empty() {
+        s.push_str(&format!("<w:r>{gray}<w:t xml:space=\"preserve\">{}</w:t></w:r>", esc_text(text)));
     }
-    Ok(doc)
+    if page_numbers {
+        let sep = if text.is_empty() { "" } else { "    " };
+        s.push_str(&format!("<w:r>{gray}<w:t xml:space=\"preserve\">{sep}Page </w:t></w:r>"));
+        s.push_str(&format!("<w:fldSimple w:instr=\" PAGE \"><w:r>{gray}<w:t>1</w:t></w:r></w:fldSimple>"));
+        s.push_str(&format!("<w:r>{gray}<w:t xml:space=\"preserve\"> of </w:t></w:r>"));
+        s.push_str(&format!("<w:fldSimple w:instr=\" NUMPAGES \"><w:r>{gray}<w:t>1</w:t></w:r></w:fldSimple>"));
+    }
+    s.push_str(&format!("</w:p></w:{tag}>"));
+    s
+}
+
+/// Body `w:sectPr` with the page setup (and possibly new header/footer refs) applied.
+fn section_xml(doc: &Document, original: Option<&str>, header: Option<&str>, footer: Option<&str>) -> String {
+    let pg = &doc.page;
+    let mut el = original.and_then(|o| xml::parse(o).ok()).unwrap_or_else(|| El::new("w:sectPr"));
+    let mut children: Vec<El> = el.elems().cloned().collect();
+    let mut set = |name: &str, build: &dyn Fn(Option<&El>) -> El| {
+        let pos = children.iter().position(|c| c.name == name);
+        let new = build(pos.map(|i| &children[i]));
+        match pos {
+            Some(i) => children[i] = new,
+            None => children.push(new),
+        }
+    };
+    set("pgSz", &|old| {
+        let mut e = old.cloned().unwrap_or_else(|| El::new("w:pgSz"));
+        e.set_attr("w:w", &tw(pg.width).to_string());
+        e.set_attr("w:h", &tw(pg.height).to_string());
+        e.attrs.retain(|(k, _)| k != "w:orient");
+        if pg.width > pg.height {
+            e.set_attr("w:orient", "landscape");
+        }
+        e
+    });
+    set("pgMar", &|old| {
+        let mut e = old.cloned().unwrap_or_else(|| El::new("w:pgMar"));
+        for (k, v) in [
+            ("w:top", pg.margins[0]),
+            ("w:right", pg.margins[1]),
+            ("w:bottom", pg.margins[2]),
+            ("w:left", pg.margins[3]),
+            ("w:header", pg.header_dist),
+            ("w:footer", pg.footer_dist),
+        ] {
+            e.set_attr(k, &tw(v).to_string());
+        }
+        if e.qattr("w:gutter").is_none() {
+            e.set_attr("w:gutter", "0");
+        }
+        e
+    });
+    for (tag, rid) in [("headerReference", header), ("footerReference", footer)] {
+        if let Some(rid) = rid {
+            children.retain(|c| !(c.name == tag && c.attr("type").is_none_or(|t| t == "default" || t == "first" || t == "even")));
+            let mut r = El::new(&format!("w:{tag}"));
+            r.set_attr("w:type", "default");
+            r.set_attr("r:id", rid);
+            children.push(r);
+            // A title page setting would hide our new default header on page 1.
+            children.retain(|c| c.name != "titlePg");
+        }
+    }
+    const SECT_ORDER: &[&str] = &[
+        "headerReference", "footerReference", "footnotePr", "endnotePr", "type", "pgSz", "pgMar", "paperSrc",
+        "pgBorders", "lnNumType", "pgNumType", "cols", "formProt", "vAlign", "noEndnote", "titlePg",
+        "textDirection", "bidi", "rtlGutter", "docGrid", "printerSettings", "sectPrChange",
+    ];
+    children.sort_by_key(|c| order_of(SECT_ORDER, &c.name));
+    el.children = children.into_iter().map(xml::Node::El).collect();
+    if el.qname.is_empty() || el.qname == "#root" {
+        el.qname = "w:sectPr".into();
+    }
+    el.to_xml()
+}
+
+fn content_types_new(has_header: bool, has_footer: bool) -> String {
+    let mut ct = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
+<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">\
+<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>\
+<Default Extension=\"xml\" ContentType=\"application/xml\"/>\
+<Default Extension=\"png\" ContentType=\"image/png\"/>\
+<Default Extension=\"jpeg\" ContentType=\"image/jpeg\"/>\
+<Default Extension=\"gif\" ContentType=\"image/gif\"/>\
+<Default Extension=\"bmp\" ContentType=\"image/bmp\"/>\
+<Override PartName=\"/word/document.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml\"/>\
+<Override PartName=\"/word/styles.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml\"/>\
+<Override PartName=\"/word/settings.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.settings+xml\"/>\
+<Override PartName=\"/word/numbering.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml\"/>\
+<Override PartName=\"/docProps/core.xml\" ContentType=\"application/vnd.openxmlformats-package.core-properties+xml\"/>\
+<Override PartName=\"/docProps/app.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.extended-properties+xml\"/>",
+    );
+    if has_header {
+        ct.push_str("<Override PartName=\"/word/header_fw.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml\"/>");
+    }
+    if has_footer {
+        ct.push_str("<Override PartName=\"/word/footer_fw.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.footer+xml\"/>");
+    }
+    ct.push_str("</Types>");
+    ct
+}
+
+/// Adds Default/Override entries to an existing [Content_Types].xml.
+fn patch_content_types(original: &str, defaults: &[(&str, &str)], overrides: &[(&str, &str)]) -> String {
+    let mut s = original.to_string();
+    let mut add = String::new();
+    for (ext, ct) in defaults {
+        let needle = format!("Extension=\"{ext}\"");
+        let needle_upper = format!("Extension=\"{}\"", ext.to_uppercase());
+        if !s.contains(&needle) && !s.contains(&needle_upper) {
+            add.push_str(&format!("<Default Extension=\"{ext}\" ContentType=\"{ct}\"/>"));
+        }
+    }
+    for (part, ct) in overrides {
+        if !s.contains(&format!("PartName=\"{part}\"")) {
+            add.push_str(&format!("<Override PartName=\"{part}\" ContentType=\"{ct}\"/>"));
+        }
+    }
+    if let Some(i) = s.rfind("</Types>") {
+        s.insert_str(i, &add);
+    }
+    s
+}
+
+fn patch_rels(original: &str, rels: &[(String, String, String, bool)]) -> String {
+    let mut s = original.to_string();
+    let add: String = rels
+        .iter()
+        .map(|(id, ty, target, ext)| {
+            format!(
+                "<Relationship Id=\"{id}\" Type=\"{ty}\" Target=\"{}\"{}/>",
+                esc(target),
+                if *ext { " TargetMode=\"External\"" } else { "" }
+            )
+        })
+        .collect();
+    match s.rfind("</Relationships>") {
+        Some(i) => s.insert_str(i, &add),
+        None => {
+            s = format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">{add}</Relationships>"
+            )
+        }
+    }
+    s
+}
+
+pub fn save_docx(doc: &Document, path: &Path) -> Result<(), String> {
+    let bytes = docx_bytes(doc)?;
+    // Write to a temporary file first so a failure never destroys the original.
+    let tmp = path.with_extension("docx.fwtmp");
+    std::fs::write(&tmp, &bytes).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        e.to_string()
+    })
+}
+
+pub fn docx_bytes(doc: &Document) -> Result<Vec<u8>, String> {
+    let pkg = doc.pkg.as_deref();
+    let main_part = "word/document.xml";
+    let orig_rels_name = "word/_rels/document.xml.rels";
+    let mut used = HashSet::new();
+    if let Some(p) = pkg {
+        if let Some(r) = p.parts.get(orig_rels_name) {
+            if let Ok(root) = xml::parse(&String::from_utf8_lossy(r)) {
+                for e in root.elems() {
+                    if let Some(id) = e.attr("Id") {
+                        used.insert(id.to_string());
+                    }
+                }
+            }
+        }
+    }
+    let mut w = Writer {
+        doc,
+        pkg_id: doc.pkg_id(),
+        cache: DiffCache::default(),
+        rels: Vec::new(),
+        link_rels: HashMap::new(),
+        image_rels: HashMap::new(),
+        media: Vec::new(),
+        doc_pr_id: 0,
+        drop_markers: HashSet::new(),
+        used_rel_ids: used,
+    };
+    w.balance_fields();
+
+    // Body.
+    let mut body = String::new();
+    if let Some(bg) = pkg.and_then(|p| p.background.as_ref()) {
+        let _ = bg; // written before the body below
+    }
+    let mut i = 0;
+    while i < doc.paras.len() {
+        if let Some(c) = doc.paras[i].cell {
+            let mut e = i;
+            while e < doc.paras.len() && doc.paras[e].cell.is_some_and(|x| x.table == c.table) {
+                e += 1;
+            }
+            w.table_xml(c.table, i..e, &mut body);
+            i = e;
+        } else {
+            w.para_xml(i, &mut body);
+            i += 1;
+        }
+    }
+
+    // Header/footer: keep the originals unless the user edited them.
+    let hf_changed = |pkg: &Package| {
+        (doc.header != pkg.header_text, doc.footer != pkg.footer_text || doc.page_numbers != pkg.page_numbers)
+    };
+    let (new_header, new_footer) = match pkg {
+        Some(p) => hf_changed(p),
+        None => (!doc.header.is_empty(), !doc.footer.is_empty() || doc.page_numbers),
+    };
+    let header_rel = new_header.then(|| w.new_rel("header", "header_fw.xml", false));
+    let footer_rel = new_footer.then(|| w.new_rel("footer", "footer_fw.xml", false));
+    let sect = section_xml(doc, pkg.and_then(|p| p.body_sect.as_deref()), header_rel.as_deref(), footer_rel.as_deref());
+
+    // Root element with the original namespace declarations.
+    let mut attrs: Vec<(String, String)> = pkg.map(|p| p.root_attrs.clone()).unwrap_or_default();
+    for (k, v) in [
+        ("xmlns:w", W_NS),
+        ("xmlns:r", R_NS),
+        ("xmlns:wp", "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"),
+        ("xmlns:a", "http://schemas.openxmlformats.org/drawingml/2006/main"),
+        ("xmlns:pic", "http://schemas.openxmlformats.org/drawingml/2006/picture"),
+    ] {
+        if !attrs.iter().any(|(a, _)| a == k) {
+            attrs.push((k.into(), v.into()));
+        }
+    }
+    let attr_s: String = attrs.iter().map(|(k, v)| format!(" {k}=\"{}\"", esc(v))).collect();
+    let background = pkg.and_then(|p| p.background.clone()).unwrap_or_default();
+    let document = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<w:document{attr_s}>{background}<w:body>{body}{sect}</w:body></w:document>"
+    );
+
+    // Assemble the package.
+    let mut parts: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    let numbering_used = doc.paras.iter().any(|p| p.list != ListKind::None);
+    match pkg {
+        Some(p) => {
+            for (k, v) in &p.parts {
+                parts.insert(k.clone(), v.clone());
+            }
+            let rels = read_rels(&p.parts, main_part);
+            let numbering_target = rels.values().find(|r| r.kind == "numbering").map(|r| r.target.clone());
+            let mut overrides: Vec<(&str, &str)> = Vec::new();
+            match numbering_target {
+                Some(t) => {
+                    let orig = String::from_utf8_lossy(&p.parts[&t]).to_string();
+                    parts.insert(t, doc.numbering.patch_xml(&orig).into_bytes());
+                }
+                None if numbering_used => {
+                    w.new_rel("numbering", "numbering_fw.xml", false);
+                    parts.insert("word/numbering_fw.xml".into(), doc.numbering.to_xml().into_bytes());
+                    overrides.push(("/word/numbering_fw.xml", "application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml"));
+                }
+                None => {}
+            }
+            if new_header {
+                parts.insert("word/header_fw.xml".into(), hf_xml("hdr", &doc.header, false).into_bytes());
+                overrides.push(("/word/header_fw.xml", "application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml"));
+            }
+            if new_footer {
+                parts.insert("word/footer_fw.xml".into(), hf_xml("ftr", &doc.footer, doc.page_numbers).into_bytes());
+                overrides.push(("/word/footer_fw.xml", "application/vnd.openxmlformats-officedocument.wordprocessingml.footer+xml"));
+            }
+            let orig_rels = p.parts.get(orig_rels_name).map(|b| String::from_utf8_lossy(b).to_string()).unwrap_or_default();
+            parts.insert(orig_rels_name.into(), patch_rels(&orig_rels, &w.rels).into_bytes());
+            let ct = String::from_utf8_lossy(p.parts.get("[Content_Types].xml").map(|v| v.as_slice()).unwrap_or(b"")).to_string();
+            let defaults = [("png", "image/png"), ("jpeg", "image/jpeg"), ("gif", "image/gif"), ("bmp", "image/bmp")];
+            parts.insert("[Content_Types].xml".into(), patch_content_types(&ct, &defaults, &overrides).into_bytes());
+        }
+        None => {
+            let rels = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
+<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\
+<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"word/document.xml\"/>\
+<Relationship Id=\"rId2\" Type=\"http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties\" Target=\"docProps/core.xml\"/>\
+<Relationship Id=\"rId3\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties\" Target=\"docProps/app.xml\"/>\
+</Relationships>";
+            parts.insert("_rels/.rels".into(), rels.as_bytes().to_vec());
+            let base_rels = vec![
+                ("rIdStyles".to_string(), format!("{REL_T}/styles"), "styles.xml".to_string(), false),
+                ("rIdSettings".to_string(), format!("{REL_T}/settings"), "settings.xml".to_string(), false),
+                ("rIdNumbering".to_string(), format!("{REL_T}/numbering"), "numbering.xml".to_string(), false),
+            ];
+            let all: Vec<_> = base_rels.into_iter().chain(w.rels.iter().cloned()).collect();
+            parts.insert(orig_rels_name.into(), patch_rels("", &all).into_bytes());
+            let styles = doc.styles.generated_xml.clone().unwrap_or_else(default_styles_xml);
+            parts.insert("word/styles.xml".into(), styles.into_bytes());
+            parts.insert("word/numbering.xml".into(), doc.numbering.to_xml().into_bytes());
+            parts.insert(
+                "word/settings.xml".into(),
+                format!(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<w:settings xmlns:w=\"{W_NS}\"><w:defaultTabStop w:val=\"{}\"/><w:characterSpacingControl w:val=\"doNotCompress\"/><w:compat><w:compatSetting w:name=\"compatibilityMode\" w:uri=\"http://schemas.microsoft.com/office/word\" w:val=\"15\"/></w:compat></w:settings>",
+                    tw(doc.page.default_tab)
+                )
+                .into_bytes(),
+            );
+            if new_header {
+                parts.insert("word/header_fw.xml".into(), hf_xml("hdr", &doc.header, false).into_bytes());
+            }
+            if new_footer {
+                parts.insert("word/footer_fw.xml".into(), hf_xml("ftr", &doc.footer, doc.page_numbers).into_bytes());
+            }
+            parts.insert("[Content_Types].xml".into(), content_types_new(new_header, new_footer).into_bytes());
+            let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
+            parts.insert(
+                "docProps/core.xml".into(),
+                format!(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<cp:coreProperties xmlns:cp=\"http://schemas.openxmlformats.org/package/2006/metadata/core-properties\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\" xmlns:dcterms=\"http://purl.org/dc/terms/\" xmlns:dcmitype=\"http://purl.org/dc/dcmitype/\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\"><dcterms:created xsi:type=\"dcterms:W3CDTF\">{now}</dcterms:created><dcterms:modified xsi:type=\"dcterms:W3CDTF\">{now}</dcterms:modified></cp:coreProperties>"
+                )
+                .into_bytes(),
+            );
+            parts.insert(
+                "docProps/app.xml".into(),
+                "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<Properties xmlns=\"http://schemas.openxmlformats.org/officeDocument/2006/extended-properties\"><Application>FreeWord</Application></Properties>"
+                    .as_bytes()
+                    .to_vec(),
+            );
+        }
+    }
+    parts.insert(main_part.into(), document.into_bytes());
+    for (name, bytes) in &w.media {
+        parts.insert(name.clone(), bytes.to_vec());
+    }
+
+    let mut buf = Cursor::new(Vec::new());
+    {
+        let mut zip = zip::ZipWriter::new(&mut buf);
+        let opts = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        // [Content_Types].xml first, as Office does.
+        let mut names: Vec<&String> = parts.keys().collect();
+        names.sort_by_key(|n| (n.as_str() != "[Content_Types].xml", n.as_str() != "_rels/.rels", (*n).clone()));
+        for name in names {
+            zip.start_file(name.as_str(), opts).map_err(|e| e.to_string())?;
+            zip.write_all(&parts[name]).map_err(|e| e.to_string())?;
+        }
+        zip.finish().map_err(|e| e.to_string())?;
+    }
+    Ok(buf.into_inner())
 }

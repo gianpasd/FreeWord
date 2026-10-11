@@ -384,14 +384,51 @@ impl App {
             "1. " | "1) " => ListKind::Number,
             _ => return,
         };
-        let p = &mut self.doc.paras[self.cursor.p];
+        let pi = self.cursor.p;
+        let p = &mut self.doc.paras[pi];
         p.end_fmt = p.fmt_at(0);
         p.chars.clear();
         p.fmts.clear();
-        p.list = kind;
+        self.make_list(pi..=pi, kind);
         self.cursor.o = 0;
         self.anchor = self.cursor;
         self.rev += 1;
+    }
+
+    /// Turns paragraphs into (or out of) a list, wiring up Word numbering.
+    pub fn make_list(&mut self, range: std::ops::RangeInclusive<usize>, kind: ListKind) {
+        let first = *range.start();
+        let num = match kind {
+            ListKind::None => 0,
+            ListKind::Bullet => {
+                // Continue an adjacent bullet list if there is one.
+                match first.checked_sub(1).map(|i| &self.doc.paras[i]) {
+                    Some(prev) if prev.list == ListKind::Bullet && prev.num_id != 0 => prev.num_id,
+                    _ => self.doc.numbering.bullet_num(),
+                }
+            }
+            ListKind::Number => match first.checked_sub(1).map(|i| &self.doc.paras[i]) {
+                Some(prev) if prev.list == ListKind::Number && prev.num_id != 0 => prev.num_id,
+                _ => self.doc.numbering.new_numbered(),
+            },
+        };
+        for pi in range {
+            let mut p = self.doc.paras[pi].clone();
+            if kind == ListKind::None {
+                p.list = ListKind::None;
+                p.num_id = 0;
+                p.level = 0;
+                let base = self.doc.styles.para_props(p.style_id.as_deref(), &self.doc.numbering);
+                let (il, _) = p.style.indents();
+                p.ind_left = if base.num.is_some() { il } else { base.ind_left };
+                p.ind_first = if base.num.is_some() { 0.0 } else { base.ind_first };
+            } else {
+                p.list = kind;
+                p.num_id = num;
+                self.doc.apply_list_indent(&mut p);
+            }
+            self.doc.paras[pi] = p;
+        }
     }
 
     pub fn insert_special(&mut self, c: char) {
@@ -405,14 +442,17 @@ impl App {
     pub fn enter(&mut self) {
         self.checkpoint(EditKind::Other);
         self.delete_selection();
-        let p = &self.doc.paras[self.cursor.p];
-        // Enter on an empty list item ends the list.
+        let pi = self.cursor.p;
+        let p = &self.doc.paras[pi];
+        // Enter on an empty list item outdents it, then ends the list.
         if p.list != ListKind::None && p.chars.is_empty() {
-            let p = &mut self.doc.paras[self.cursor.p];
             if p.level > 0 {
-                p.level -= 1;
+                let mut q = p.clone();
+                q.level -= 1;
+                self.doc.apply_list_indent(&mut q);
+                self.doc.paras[pi] = q;
             } else {
-                p.list = ListKind::None;
+                self.make_list(pi..=pi, ListKind::None);
             }
             return;
         }
@@ -428,19 +468,34 @@ impl App {
         }
         let c = self.cursor;
         if c.o == 0 {
-            let p = &mut self.doc.paras[c.p];
+            let p = &self.doc.paras[c.p];
             // First remove list formatting / indentation, like Word.
-            if p.list != ListKind::None || p.level > 0 {
+            if p.list != ListKind::None {
+                self.checkpoint(EditKind::Other);
+                self.make_list(c.p..=c.p, ListKind::None);
+                return;
+            }
+            if p.ind_first > 0.5 || (p.ind_left > 0.5 && p.style.indents().0 < p.ind_left) {
                 self.checkpoint(EditKind::Other);
                 let p = &mut self.doc.paras[c.p];
-                if p.list != ListKind::None {
-                    p.list = ListKind::None;
+                if p.ind_first > 0.5 {
+                    p.ind_first = 0.0;
                 } else {
-                    p.level -= 1;
+                    p.ind_left = (p.ind_left - 36.0).max(0.0);
                 }
                 return;
             }
             if c.p == 0 {
+                return;
+            }
+            // Never merge across table cells or table boundaries.
+            if self.doc.paras[c.p - 1].cell != p.cell {
+                if p.chars.is_empty() && p.cell.is_none() && c.p + 1 < self.doc.paras.len() {
+                    self.checkpoint(EditKind::Delete);
+                    self.doc.paras.remove(c.p);
+                }
+                let prev = Pos::new(c.p - 1, self.doc.paras[c.p - 1].len());
+                self.set_cursor(prev, false);
                 return;
             }
         }
@@ -459,6 +514,15 @@ impl App {
             return;
         }
         let c = self.cursor;
+        if self.doc.at_cell_end(c) {
+            let p = &self.doc.paras[c.p];
+            if p.chars.is_empty() && p.cell.is_none() {
+                self.checkpoint(EditKind::Delete);
+                self.doc.paras.remove(c.p);
+                self.set_cursor(Pos::new(c.p, 0), false);
+            }
+            return;
+        }
         let end = if word { self.doc.word_right(c) } else { self.doc.next(c) };
         if end == c {
             return;
@@ -466,6 +530,377 @@ impl App {
         self.checkpoint(EditKind::Delete);
         self.doc.delete(c, end);
         self.doc.gc_images();
+    }
+
+    // ------------------------------------------------------------ tables
+
+    pub fn in_table(&self) -> Option<crate::doc::CellRef> {
+        self.doc.paras[self.cursor.p].cell
+    }
+
+    pub fn insert_table(&mut self, rows: u32, cols: u32) {
+        if self.in_table().is_some() {
+            self.set_status("Tables cannot be inserted inside a table cell");
+            return;
+        }
+        self.checkpoint(EditKind::Other);
+        self.delete_selection();
+        let mut at = self.cursor.p;
+        if self.cursor.o > 0 {
+            let np = self.doc.split(self.cursor);
+            at = np.p;
+        }
+        let id = self.doc.next_table_id();
+        let width = self.content_width_pt();
+        let mut t = crate::doc::Table { grid: vec![width / cols as f32; cols as usize], borders: true, ..Default::default() };
+        let mut cells = Vec::new();
+        let base_fmt = self.doc.paras[at].fmt_at(0);
+        for r in 0..rows {
+            t.rows.insert(r, Default::default());
+            for c in 0..cols {
+                t.cells.insert((r, c), crate::doc::CellProps { span: 1, ..Default::default() });
+                cells.push(self.new_cell_para(crate::doc::CellRef { table: id, row: r, col: c }, base_fmt));
+            }
+        }
+        self.doc.tables.insert(id, t);
+        for (i, p) in cells.into_iter().enumerate() {
+            self.doc.paras.insert(at + i, p);
+        }
+        self.doc.ensure_trailing_para();
+        self.set_cursor(Pos::new(at, 0), false);
+    }
+
+    fn new_cell_para(&self, cell: crate::doc::CellRef, fmt: CharFmt) -> Para {
+        let mut p = Para::new(Style::Normal);
+        p.style_id = self.doc.styles.default_para.clone();
+        p.space_after = 0.0;
+        p.space_before = 0.0;
+        p.line_spacing = 1.0;
+        p.cell = Some(cell);
+        p.end_fmt = fmt;
+        p
+    }
+
+    /// Moves the cursor to the next (or previous) cell; adds a row after the last cell.
+    pub fn next_cell(&mut self, forward: bool) {
+        let Some(cur) = self.in_table() else { return };
+        let range = self.doc.cell_range(self.cursor.p);
+        if forward {
+            let e = range.end;
+            if e < self.doc.paras.len() && self.doc.paras[e].cell.is_some_and(|c| c.table == cur.table) {
+                let len = self.doc.cell_range(e).end;
+                let last = len - 1;
+                self.select(Pos::new(e, 0), Pos::new(last, self.doc.paras[last].len()));
+            } else {
+                self.table_insert_row(true);
+            }
+        } else if range.start > 0 && self.doc.paras[range.start - 1].cell.is_some_and(|c| c.table == cur.table) {
+            let prev = self.doc.cell_range(range.start - 1);
+            let last = prev.end - 1;
+            self.select(Pos::new(prev.start, 0), Pos::new(last, self.doc.paras[last].len()));
+        }
+    }
+
+    /// Renumbers table cells; `f` maps (row, col) to a new position or None to drop.
+    fn remap_rows(&mut self, table: u32, f: impl Fn(u32) -> u32) {
+        for p in &mut self.doc.paras {
+            if let Some(c) = &mut p.cell {
+                if c.table == table {
+                    c.row = f(c.row);
+                }
+            }
+        }
+        if let Some(t) = self.doc.tables.get_mut(&table) {
+            t.cells = std::mem::take(&mut t.cells).into_iter().map(|((r, c), v)| ((f(r), c), v)).collect();
+            t.rows = std::mem::take(&mut t.rows).into_iter().map(|(r, v)| (f(r), v)).collect();
+        }
+    }
+
+    pub fn table_insert_row(&mut self, below: bool) {
+        let Some(cur) = self.in_table() else { return };
+        self.checkpoint(EditKind::Other);
+        let range = self.doc.table_range(cur.table);
+        let row_paras: Vec<usize> = range.clone().filter(|&i| self.doc.paras[i].cell.unwrap().row == cur.row).collect();
+        let (first, last) = (row_paras[0], *row_paras.last().unwrap());
+        let new_row = if below { cur.row + 1 } else { cur.row };
+        self.remap_rows(cur.table, |r| if r >= new_row { r + 1 } else { r });
+        // One empty paragraph per cell of the template row.
+        let mut cols: Vec<u32> = row_paras.iter().map(|&i| self.doc.paras[i].cell.unwrap().col).collect();
+        cols.dedup();
+        let fmt = self.doc.paras[first].fmt_at(0);
+        let t = self.doc.tables.get(&cur.table).cloned().unwrap_or_default();
+        let template_row = if below { cur.row } else { cur.row + 1 };
+        let mut new_paras = Vec::new();
+        for c in &cols {
+            let props = t.cell(template_row, *c);
+            new_paras.push(self.new_cell_para(crate::doc::CellRef { table: cur.table, row: new_row, col: *c }, fmt));
+            let tm = self.doc.tables.get_mut(&cur.table).unwrap();
+            tm.cells.insert(
+                (new_row, *c),
+                crate::doc::CellProps {
+                    span: props.span,
+                    shade: props.shade,
+                    tcpr_raw: props.tcpr_raw.clone(),
+                    vmerge: crate::doc::VMerge::None,
+                },
+            );
+        }
+        let at = if below { last + 1 } else { first };
+        for (i, p) in new_paras.into_iter().enumerate() {
+            self.doc.paras.insert(at + i, p);
+        }
+        self.set_cursor(Pos::new(at, 0), false);
+    }
+
+    pub fn table_delete_row(&mut self) {
+        let Some(cur) = self.in_table() else { return };
+        self.checkpoint(EditKind::Other);
+        let range = self.doc.table_range(cur.table);
+        let start = range.start;
+        let mut i = range.end;
+        while i > range.start {
+            i -= 1;
+            if self.doc.paras[i].cell.unwrap().row == cur.row {
+                self.doc.paras.remove(i);
+            }
+        }
+        if let Some(t) = self.doc.tables.get_mut(&cur.table) {
+            t.cells.retain(|(r, _), _| *r != cur.row);
+            t.rows.remove(&cur.row);
+        }
+        self.remap_rows(cur.table, |r| if r > cur.row { r - 1 } else { r });
+        if self.doc.table_range(cur.table).is_empty() {
+            self.doc.tables.remove(&cur.table);
+        }
+        self.fix_after_table_edit(start);
+    }
+
+    pub fn table_insert_col(&mut self, right: bool) {
+        let Some(cur) = self.in_table() else { return };
+        self.checkpoint(EditKind::Other);
+        let t = self.doc.tables.get(&cur.table).cloned().unwrap_or_default();
+        let span = t.cell(cur.row, cur.col).span.max(1);
+        let new_col = if right { cur.col + span } else { cur.col };
+        let total: f32 = t.grid.iter().sum();
+        let mut grid = t.grid.clone();
+        let w = total / (grid.len() as f32 + 1.0);
+        grid.insert((new_col as usize).min(grid.len()), w);
+        let scale = total / grid.iter().sum::<f32>();
+        for g in &mut grid {
+            *g *= scale;
+        }
+        // Shift cells at or after the new column.
+        for p in &mut self.doc.paras {
+            if let Some(c) = &mut p.cell {
+                if c.table == cur.table && c.col >= new_col {
+                    c.col += 1;
+                }
+            }
+        }
+        let mut cells: BTreeMap<(u32, u32), crate::doc::CellProps> = BTreeMap::new();
+        for ((r, c), v) in t.cells {
+            let nc = if c >= new_col { c + 1 } else { c };
+            cells.insert((r, nc), v);
+        }
+        // Insert a new cell into each row, before the first cell that starts after it.
+        let range = self.doc.table_range(cur.table);
+        let rows: Vec<u32> = {
+            let mut v: Vec<u32> = range.clone().map(|i| self.doc.paras[i].cell.unwrap().row).collect();
+            v.dedup();
+            v
+        };
+        let fmt = self.doc.paras[range.start].fmt_at(0);
+        for row in rows {
+            let range = self.doc.table_range(cur.table);
+            let spans_over = cells.iter().any(|((r, c), v)| *r == row && *c < new_col && c + v.span.max(1) > new_col);
+            if spans_over {
+                if let Some((_, v)) = cells.iter_mut().find(|((r, c), v)| *r == row && *c < new_col && c + v.span.max(1) > new_col) {
+                    v.span += 1;
+                }
+                continue;
+            }
+            let pos = range
+                .clone()
+                .find(|&i| {
+                    let c = self.doc.paras[i].cell.unwrap();
+                    c.row > row || (c.row == row && c.col > new_col)
+                })
+                .unwrap_or(range.end);
+            let p = self.new_cell_para(crate::doc::CellRef { table: cur.table, row, col: new_col }, fmt);
+            self.doc.paras.insert(pos, p);
+            cells.insert((row, new_col), crate::doc::CellProps { span: 1, ..Default::default() });
+        }
+        let tm = self.doc.tables.get_mut(&cur.table).unwrap();
+        tm.grid = grid;
+        tm.cells = cells;
+        let c = self.doc.clamp(self.cursor);
+        self.set_cursor(c, false);
+    }
+
+    pub fn table_delete_col(&mut self) {
+        let Some(cur) = self.in_table() else { return };
+        self.checkpoint(EditKind::Other);
+        let col = cur.col;
+        let range = self.doc.table_range(cur.table);
+        let start = range.start;
+        let mut t = self.doc.tables.get(&cur.table).cloned().unwrap_or_default();
+        // Remove single-column cells in this column; shrink cells spanning it.
+        let mut i = range.end;
+        while i > range.start {
+            i -= 1;
+            let c = self.doc.paras[i].cell.unwrap();
+            let span = t.cell(c.row, c.col).span.max(1);
+            if c.col == col && span == 1 {
+                self.doc.paras.remove(i);
+            }
+        }
+        let mut cells = BTreeMap::new();
+        for ((r, c), mut v) in std::mem::take(&mut t.cells) {
+            let span = v.span.max(1);
+            if c == col && span == 1 {
+                continue;
+            }
+            if c <= col && c + span > col {
+                v.span = span - 1;
+            }
+            let nc = if c > col { c - 1 } else { c };
+            cells.insert((r, nc), v);
+        }
+        t.cells = cells;
+        if (col as usize) < t.grid.len() {
+            t.grid.remove(col as usize);
+        }
+        for p in &mut self.doc.paras {
+            if let Some(c) = &mut p.cell {
+                if c.table == cur.table && c.col > col {
+                    c.col -= 1;
+                }
+            }
+        }
+        if t.grid.is_empty() || self.doc.table_range(cur.table).is_empty() {
+            let r = self.doc.table_range(cur.table);
+            self.doc.paras.drain(r);
+            self.doc.tables.remove(&cur.table);
+        } else {
+            self.doc.tables.insert(cur.table, t);
+        }
+        self.fix_after_table_edit(start);
+    }
+
+    pub fn delete_table(&mut self) {
+        let Some(cur) = self.in_table() else { return };
+        self.checkpoint(EditKind::Other);
+        let r = self.doc.table_range(cur.table);
+        let start = r.start;
+        self.doc.paras.drain(r);
+        self.doc.tables.remove(&cur.table);
+        self.fix_after_table_edit(start);
+    }
+
+    pub fn toggle_table_borders(&mut self) {
+        let Some(cur) = self.in_table() else { return };
+        self.checkpoint(EditKind::Other);
+        if let Some(t) = self.doc.tables.get_mut(&cur.table) {
+            t.borders = !t.borders;
+            // Generated table properties (with or without borders) replace the original ones.
+            t.tblpr_raw = None;
+        }
+    }
+
+    pub fn shade_cell(&mut self, color: Option<crate::doc::Rgba>) {
+        let Some(cur) = self.in_table() else { return };
+        self.checkpoint(EditKind::Other);
+        if let Some(t) = self.doc.tables.get_mut(&cur.table) {
+            t.cells.entry((cur.row, cur.col)).or_insert(crate::doc::CellProps { span: 1, ..Default::default() }).shade = color;
+        }
+    }
+
+    fn fix_after_table_edit(&mut self, at: usize) {
+        if self.doc.paras.is_empty() {
+            self.doc.paras.push(Para::new(Style::Normal));
+        }
+        self.doc.ensure_trailing_para();
+        let p = at.min(self.doc.paras.len() - 1);
+        self.set_cursor(Pos::new(p, 0), false);
+    }
+
+    // ------------------------------------------------------------ hyperlinks
+
+    pub fn link_at_cursor(&self) -> Option<u32> {
+        let p = &self.doc.paras[self.cursor.p];
+        let o = self.cursor.o;
+        [o, o.saturating_sub(1)].into_iter().filter_map(|i| p.fmts.get(i)).map(|f| f.link).find(|l| *l != 0)
+    }
+
+    /// Adds a hyperlink to the selection, or inserts `text` as a link.
+    pub fn insert_link(&mut self, url: &str, text: &str) {
+        let url = url.trim();
+        if url.is_empty() {
+            return;
+        }
+        let (u, a) = match url.strip_prefix('#') {
+            Some(anchor) => (String::new(), anchor.to_string()),
+            None => (url.to_string(), String::new()),
+        };
+        let id = crate::pool::link_id(&u, &a);
+        let style = |f: &mut CharFmt| {
+            f.link = id;
+            f.color = [0x05, 0x63, 0xC1, 255];
+            f.underline = true;
+        };
+        self.checkpoint(EditKind::Other);
+        if self.has_sel() {
+            let (a, b) = self.sel();
+            self.doc.apply_fmt(a, b, &|f: &mut CharFmt| {
+                if !f.is_object() {
+                    style(f);
+                }
+            });
+        } else {
+            let mut f = self.current_fmt();
+            style(&mut f);
+            let t = if text.is_empty() { url } else { text };
+            self.cursor = self.doc.insert_text(self.cursor, t, f);
+            self.anchor = self.cursor;
+        }
+    }
+
+    pub fn remove_link(&mut self) {
+        let Some(id) = self.link_at_cursor() else { return };
+        self.checkpoint(EditKind::Other);
+        let base = self.doc.styles.char_fmt(self.doc.paras[self.cursor.p].style_id.as_deref(), None);
+        for p in &mut self.doc.paras {
+            for f in &mut p.fmts {
+                if f.link == id {
+                    f.link = 0;
+                    f.color = base.color;
+                    f.underline = base.underline;
+                    f.rpr_extra = 0;
+                }
+            }
+        }
+    }
+
+    pub fn open_link(&mut self, id: u32) {
+        let (url, anchor) = crate::pool::link(id);
+        if !url.is_empty() {
+            if let Err(e) = io::open_with_system(Path::new(&url)) {
+                self.error(format!("Could not open link: {e}"));
+            }
+        } else if !anchor.is_empty() {
+            // Jump to the bookmark with that name.
+            let needle = format!("w:name=\"{}\"", crate::xml::esc(&anchor));
+            for (pi, p) in self.doc.paras.iter().enumerate() {
+                for (ci, f) in p.fmts.iter().enumerate() {
+                    if let Some(o) = crate::pool::obj(f.obj) {
+                        if o.xml.contains("bookmarkStart") && o.xml.contains(&needle) {
+                            self.set_cursor(Pos::new(pi, ci), false);
+                            return;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // ------------------------------------------------------------ clipboard
@@ -708,20 +1143,41 @@ impl App {
     pub fn toggle_list(&mut self, kind: ListKind) {
         let all = self.para_range().all(|p| self.doc.paras[p].list == kind);
         let new = if all { ListKind::None } else { kind };
-        self.apply_para(|p| p.list = new);
+        self.checkpoint(EditKind::Other);
+        let r = self.para_range();
+        self.make_list(r, new);
     }
 
+    /// Indent/outdent: list items change level, other paragraphs move by 0.5".
     pub fn indent(&mut self, delta: i32) {
-        self.apply_para(|p| p.level = (p.level as i32 + delta).clamp(0, 8) as u8);
+        self.checkpoint(EditKind::Other);
+        for pi in self.para_range() {
+            let mut p = self.doc.paras[pi].clone();
+            if p.list != ListKind::None {
+                p.level = (p.level as i32 + delta).clamp(0, 8) as u8;
+                self.doc.apply_list_indent(&mut p);
+            } else {
+                p.ind_left = (p.ind_left + delta as f32 * 36.0).max(0.0);
+            }
+            self.doc.paras[pi] = p;
+        }
     }
 
     pub fn set_style(&mut self, s: Style) {
-        self.apply_para(|p| p.set_style(s));
+        self.checkpoint(EditKind::Other);
+        for pi in self.para_range() {
+            let mut p = self.doc.paras[pi].clone();
+            self.doc.set_para_style(&mut p, s);
+            self.doc.paras[pi] = p;
+        }
         self.pending_fmt = None;
     }
 
     pub fn set_line_spacing(&mut self, v: f32) {
-        self.apply_para(|p| p.line_spacing = v);
+        self.apply_para(|p| {
+            p.line_spacing = v;
+            p.line_rule = crate::doc::LineRule::Auto;
+        });
     }
 
     // ------------------------------------------------------------ format painter

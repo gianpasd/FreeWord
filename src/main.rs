@@ -7,7 +7,10 @@ mod editor;
 mod fonts;
 mod io;
 mod layout;
+mod numbering;
 mod pdf;
+mod pool;
+mod styles;
 mod ui;
 mod xml;
 

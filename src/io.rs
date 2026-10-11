@@ -1,12 +1,15 @@
 //! Native (.fwd JSON), plain text and HTML formats.
 
 use crate::doc::{
-    Align, CharFmt, Document, ImageData, LINE_BREAK, ListKind, OBJ, PAGE_BREAK, PageSetup, Para,
-    Rgba, Style,
+    Align, CellRef, CharFmt, Document, ImageData, LINE_BREAK, LineRule, ListKind, OBJ, PAGE_BREAK, Package,
+    PageSetup, Para, Rgba, Style, TabStop, Table,
 };
 use crate::fonts;
+use crate::numbering::Numbering;
+use crate::pool::{self, ObjKind, RawObj};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -15,12 +18,7 @@ pub fn hex(c: Rgba) -> String {
 }
 
 pub fn parse_hex(s: &str) -> Option<Rgba> {
-    let s = s.trim_start_matches('#');
-    if s.len() != 6 {
-        return None;
-    }
-    let v = u32::from_str_radix(s, 16).ok()?;
-    Some([(v >> 16) as u8, (v >> 8) as u8, v as u8, 255])
+    crate::styles::parse_hex(s)
 }
 
 /// (file extension, mime type) sniffed from image bytes.
@@ -51,7 +49,7 @@ pub fn image_from_bytes(bytes: Vec<u8>, max_w: f32) -> Result<ImageData, String>
         dh *= max_w / dw;
         dw = max_w;
     }
-    Ok(ImageData { bytes: Arc::new(bytes), px_w: w, px_h: h, w: dw, h: dh })
+    Ok(ImageData { bytes: Arc::new(bytes), px_w: w, px_h: h, w: dw, h: dh, raw: None })
 }
 
 // ---------------------------------------------------------------- native
@@ -69,7 +67,24 @@ struct FileDoc {
     page_numbers: bool,
     #[serde(default)]
     images: Vec<FileImage>,
+    #[serde(default)]
+    tables: BTreeMap<u32, Table>,
+    #[serde(default)]
+    numbering: Option<Numbering>,
+    #[serde(default)]
+    package: Option<FilePackage>,
     paras: Vec<FilePara>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct FilePackage {
+    parts: BTreeMap<String, String>,
+    root_attrs: Vec<(String, String)>,
+    body_sect: Option<String>,
+    header_text: String,
+    footer_text: String,
+    page_numbers: bool,
+    background: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -78,17 +93,47 @@ struct FileImage {
     w: f32,
     h: f32,
     data: String,
+    #[serde(default)]
+    raw: Option<String>,
+}
+
+fn d_auto() -> LineRule {
+    LineRule::Auto
 }
 
 #[derive(Serialize, Deserialize)]
 struct FilePara {
     style: Style,
+    #[serde(default)]
+    style_id: Option<String>,
     align: Align,
     list: ListKind,
     level: u8,
+    #[serde(default)]
+    num_id: u32,
     line_spacing: f32,
+    #[serde(default = "d_auto")]
+    line_rule: LineRule,
     space_before: f32,
     space_after: f32,
+    #[serde(default)]
+    contextual: bool,
+    #[serde(default)]
+    ind: Option<[f32; 3]>,
+    #[serde(default)]
+    tabs: Vec<TabStop>,
+    #[serde(default)]
+    shading: Option<String>,
+    #[serde(default)]
+    page_break_before: bool,
+    #[serde(default)]
+    sect_break: bool,
+    #[serde(default)]
+    ppr_extra: String,
+    #[serde(default)]
+    cell: Option<CellRef>,
+    #[serde(default)]
+    raw_block: Option<String>,
     end: FileFmt,
     runs: Vec<FileRun>,
 }
@@ -97,6 +142,12 @@ struct FilePara {
 struct FileRun {
     text: String,
     fmt: FileFmt,
+}
+
+#[derive(Serialize, Deserialize)]
+struct FileObj {
+    xml: String,
+    kind: ObjKind,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -111,6 +162,14 @@ struct FileFmt {
     underline: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     strike: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    caps: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    small_caps: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    hidden: bool,
+    #[serde(default, skip_serializing_if = "is_zero_f32")]
+    char_spacing: f32,
     #[serde(default, skip_serializing_if = "is_zero_i8")]
     script: i8,
     color: String,
@@ -118,6 +177,12 @@ struct FileFmt {
     highlight: Option<String>,
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     image: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    link: Option<(String, String)>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    rpr_extra: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    obj: Option<FileObj>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -129,6 +194,9 @@ fn is_zero_i8(v: &i8) -> bool {
 fn is_zero_u32(v: &u32) -> bool {
     *v == 0
 }
+fn is_zero_f32(v: &f32) -> bool {
+    *v == 0.0
+}
 
 impl From<&CharFmt> for FileFmt {
     fn from(f: &CharFmt) -> Self {
@@ -139,28 +207,44 @@ impl From<&CharFmt> for FileFmt {
             italic: f.italic,
             underline: f.underline,
             strike: f.strike,
+            caps: f.caps,
+            small_caps: f.small_caps,
+            hidden: f.hidden,
+            char_spacing: f.char_spacing,
             script: f.script,
             color: hex(f.color),
             highlight: (f.highlight[3] > 0).then(|| hex(f.highlight)),
             image: f.image,
+            link: (f.link != 0).then(|| pool::link(f.link)),
+            rpr_extra: pool::get(f.rpr_extra),
+            obj: pool::obj(f.obj).map(|o| FileObj { xml: o.xml, kind: o.kind }),
         }
     }
 }
 
-impl From<&FileFmt> for CharFmt {
-    fn from(f: &FileFmt) -> Self {
-        CharFmt {
-            font: fonts::font_id(&f.font),
-            size: f.size.clamp(1.0, 1638.0),
-            bold: f.bold,
-            italic: f.italic,
-            underline: f.underline,
-            strike: f.strike,
-            script: f.script.clamp(-1, 1),
-            color: parse_hex(&f.color).unwrap_or(crate::doc::BLACK),
-            highlight: f.highlight.as_deref().and_then(parse_hex).unwrap_or(crate::doc::NO_COLOR),
-            image: f.image,
-        }
+fn fmt_from_file(f: &FileFmt, pkg: u64) -> CharFmt {
+    CharFmt {
+        font: fonts::font_id(&f.font),
+        size: f.size.clamp(1.0, 1638.0),
+        bold: f.bold,
+        italic: f.italic,
+        underline: f.underline,
+        strike: f.strike,
+        caps: f.caps,
+        small_caps: f.small_caps,
+        hidden: f.hidden,
+        char_spacing: f.char_spacing,
+        script: f.script.clamp(-1, 1),
+        color: parse_hex(&f.color).unwrap_or(crate::doc::BLACK),
+        highlight: f.highlight.as_deref().and_then(parse_hex).unwrap_or(crate::doc::NO_COLOR),
+        image: f.image,
+        link: f.link.as_ref().map(|(u, a)| pool::link_id(u, a)).unwrap_or(0),
+        rpr_extra: pool::intern(&f.rpr_extra),
+        obj: f
+            .obj
+            .as_ref()
+            .map(|o| pool::add_obj(RawObj { xml: o.xml.clone(), kind: o.kind.clone(), pkg }))
+            .unwrap_or(0),
     }
 }
 
@@ -169,7 +253,7 @@ pub fn runs(p: &Para) -> Vec<(String, CharFmt)> {
     let mut out: Vec<(String, CharFmt)> = Vec::new();
     for (c, f) in p.chars.iter().zip(&p.fmts) {
         match out.last_mut() {
-            Some((s, lf)) if lf == f && f.image == 0 => s.push(*c),
+            Some((s, lf)) if lf == f && !f.is_object() => s.push(*c),
             _ => out.push((c.to_string(), *f)),
         }
     }
@@ -178,9 +262,18 @@ pub fn runs(p: &Para) -> Vec<(String, CharFmt)> {
 
 pub fn save_native(doc: &Document, path: &Path) -> Result<(), String> {
     let b64 = base64::engine::general_purpose::STANDARD;
+    let package = doc.pkg.as_ref().map(|p| FilePackage {
+        parts: p.parts.iter().map(|(k, v)| (k.clone(), b64.encode(v))).collect(),
+        root_attrs: p.root_attrs.clone(),
+        body_sect: p.body_sect.clone(),
+        header_text: p.header_text.clone(),
+        footer_text: p.footer_text.clone(),
+        page_numbers: p.page_numbers,
+        background: p.background.clone(),
+    });
     let fd = FileDoc {
         app: "FreeWord".into(),
-        version: 1,
+        version: 2,
         page: doc.page.clone(),
         header: doc.header.clone(),
         footer: doc.footer.clone(),
@@ -188,19 +281,40 @@ pub fn save_native(doc: &Document, path: &Path) -> Result<(), String> {
         images: doc
             .images
             .iter()
-            .map(|(id, img)| FileImage { id: *id, w: img.w, h: img.h, data: b64.encode(img.bytes.as_slice()) })
+            .map(|(id, img)| FileImage {
+                id: *id,
+                w: img.w,
+                h: img.h,
+                data: b64.encode(img.bytes.as_slice()),
+                raw: img.raw.as_ref().map(|r| r.0.clone()),
+            })
             .collect(),
+        tables: doc.tables.clone(),
+        numbering: Some(doc.numbering.clone()),
+        package,
         paras: doc
             .paras
             .iter()
             .map(|p| FilePara {
                 style: p.style,
+                style_id: p.style_id.clone(),
                 align: p.align,
                 list: p.list,
                 level: p.level,
+                num_id: p.num_id,
                 line_spacing: p.line_spacing,
+                line_rule: p.line_rule,
                 space_before: p.space_before,
                 space_after: p.space_after,
+                contextual: p.contextual,
+                ind: Some([p.ind_left, p.ind_right, p.ind_first]),
+                tabs: p.tabs.clone(),
+                shading: (p.shading[3] > 0).then(|| hex(p.shading)),
+                page_break_before: p.page_break_before,
+                sect_break: p.sect_break,
+                ppr_extra: p.ppr_extra.clone(),
+                cell: p.cell,
+                raw_block: p.raw_block.clone(),
                 end: (&p.end_fmt).into(),
                 runs: runs(p).iter().map(|(t, f)| FileRun { text: t.clone(), fmt: f.into() }).collect(),
             })
@@ -219,29 +333,69 @@ pub fn load_native(path: &Path) -> Result<Document, String> {
     doc.header = fd.header;
     doc.footer = fd.footer;
     doc.page_numbers = fd.page_numbers;
+    doc.tables = fd.tables;
+    let mut pkg_id = 0;
+    if let Some(fp) = fd.package {
+        let parts: BTreeMap<String, Vec<u8>> =
+            fp.parts.into_iter().filter_map(|(k, v)| b64.decode(v.as_bytes()).ok().map(|b| (k, b))).collect();
+        pkg_id = pool::new_pkg_id();
+        doc.styles = Arc::new(crate::docx::sheet_from_parts(&parts));
+        doc.pkg = Some(Arc::new(Package {
+            id: pkg_id,
+            parts,
+            root_attrs: fp.root_attrs,
+            body_sect: fp.body_sect,
+            header_text: fp.header_text,
+            footer_text: fp.footer_text,
+            page_numbers: fp.page_numbers,
+            background: fp.background,
+        }));
+    }
+    match fd.numbering {
+        Some(n) => doc.numbering = n,
+        None => doc.numbering = Numbering::new_default(),
+    }
     for im in fd.images {
         if let Ok(bytes) = b64.decode(im.data.as_bytes()) {
             if let Ok(mut data) = image_from_bytes(bytes, f32::MAX) {
                 data.w = im.w;
                 data.h = im.h;
+                data.raw = im.raw.map(|r| (r, pkg_id));
                 doc.images.insert(im.id, data);
             }
         }
     }
+    let version = fd.version;
     doc.paras = fd
         .paras
         .iter()
         .map(|fp| {
             let mut p = Para::new(fp.style);
+            p.style_id = fp.style_id.clone();
             p.align = fp.align;
             p.list = fp.list;
             p.level = fp.level.min(8);
+            p.num_id = fp.num_id;
             p.line_spacing = fp.line_spacing;
+            p.line_rule = fp.line_rule;
             p.space_before = fp.space_before;
             p.space_after = fp.space_after;
-            p.end_fmt = (&fp.end).into();
+            p.contextual = fp.contextual;
+            if let Some([l, r, f]) = fp.ind {
+                p.ind_left = l;
+                p.ind_right = r;
+                p.ind_first = f;
+            }
+            p.tabs = fp.tabs.clone();
+            p.shading = fp.shading.as_deref().and_then(parse_hex).unwrap_or(crate::doc::NO_COLOR);
+            p.page_break_before = fp.page_break_before;
+            p.sect_break = fp.sect_break;
+            p.ppr_extra = fp.ppr_extra.clone();
+            p.cell = fp.cell;
+            p.raw_block = fp.raw_block.clone();
+            p.end_fmt = fmt_from_file(&fp.end, pkg_id);
             for r in &fp.runs {
-                let f: CharFmt = (&r.fmt).into();
+                let f = fmt_from_file(&r.fmt, pkg_id);
                 for c in r.text.chars() {
                     p.chars.push(c);
                     p.fmts.push(f);
@@ -250,6 +404,10 @@ pub fn load_native(path: &Path) -> Result<Document, String> {
             p
         })
         .collect();
+    // Version 1 files: list numbering and indent levels were implicit.
+    if version < 2 {
+        upgrade_v1(&mut doc);
+    }
     // Drop pictures whose data could not be decoded.
     for p in &mut doc.paras {
         let mut i = 0;
@@ -265,7 +423,41 @@ pub fn load_native(path: &Path) -> Result<Document, String> {
     if doc.paras.is_empty() {
         doc.paras.push(Para::new(Style::Normal));
     }
+    doc.ensure_trailing_para();
     Ok(doc)
+}
+
+fn upgrade_v1(doc: &mut Document) {
+    let bullet = doc.numbering.bullet_num();
+    let mut number = 0;
+    let mut prev_numbered = false;
+    for i in 0..doc.paras.len() {
+        let kind = doc.paras[i].list;
+        match kind {
+            ListKind::None => {
+                let lvl = doc.paras[i].level;
+                let p = &mut doc.paras[i];
+                p.ind_left += lvl as f32 * 36.0;
+                p.level = 0;
+                prev_numbered = false;
+            }
+            ListKind::Bullet => {
+                doc.paras[i].num_id = bullet;
+            }
+            ListKind::Number => {
+                if !prev_numbered {
+                    number = doc.numbering.new_numbered();
+                }
+                doc.paras[i].num_id = number;
+                prev_numbered = true;
+            }
+        }
+        if kind != ListKind::None {
+            let mut p = doc.paras[i].clone();
+            doc.apply_list_indent(&mut p);
+            doc.paras[i] = p;
+        }
+    }
 }
 
 // ---------------------------------------------------------------- text
@@ -289,17 +481,35 @@ pub fn load_text(path: &Path) -> Result<Document, String> {
 }
 
 pub fn save_text(doc: &Document, path: &Path) -> Result<(), String> {
-    let labels = crate::doc::list_labels(&doc.paras);
+    let labels = doc.list_labels();
     let mut s = String::new();
+    let mut prev_cell = None;
     for (p, label) in doc.paras.iter().zip(labels) {
+        if p.cell.is_some() && prev_cell.is_some_and(|c: crate::doc::CellRef| p.cell.unwrap().row == c.row && p.cell != Some(c)) {
+            // Next cell in the same row: separate with a tab instead of a newline.
+            if s.ends_with("\r\n") {
+                s.truncate(s.len() - 2);
+            }
+            s.push('\t');
+        }
+        prev_cell = p.cell;
         if let Some(l) = label {
             s.push_str(&"    ".repeat(p.level as usize));
             s.push_str(&l);
             s.push(' ');
         }
-        for &c in &p.chars {
+        for (&c, f) in p.chars.iter().zip(&p.fmts) {
+            if f.hidden {
+                continue;
+            }
             match c {
-                OBJ => {}
+                OBJ => {
+                    if let Some(o) = pool::obj(f.obj) {
+                        if let ObjKind::Label(t) = o.kind {
+                            s.push_str(&t);
+                        }
+                    }
+                }
                 LINE_BREAK => s.push_str("\r\n"),
                 PAGE_BREAK => s.push('\x0c'),
                 c => s.push(c),
@@ -329,6 +539,15 @@ fn css_fmt(f: &CharFmt) -> String {
     if f.italic {
         s.push_str("font-style:italic;");
     }
+    if f.caps {
+        s.push_str("text-transform:uppercase;");
+    }
+    if f.small_caps {
+        s.push_str("font-variant:small-caps;");
+    }
+    if f.char_spacing != 0.0 {
+        s.push_str(&format!("letter-spacing:{}pt;", f.char_spacing));
+    }
     match (f.underline, f.strike) {
         (true, true) => s.push_str("text-decoration:underline line-through;"),
         (true, false) => s.push_str("text-decoration:underline;"),
@@ -346,8 +565,109 @@ fn css_fmt(f: &CharFmt) -> String {
     s
 }
 
-pub fn to_html(doc: &Document, title: &str, print: bool) -> String {
+fn para_html(doc: &Document, p: &Para, label: Option<&String>, h: &mut String) {
     let b64 = base64::engine::general_purpose::STANDARD;
+    let align = match p.align {
+        Align::Left => "left",
+        Align::Center => "center",
+        Align::Right => "right",
+        Align::Justify => "justify",
+    };
+    let tag = match p.style {
+        crate::doc::Style::Title | crate::doc::Style::Heading1 => "h1",
+        crate::doc::Style::Heading2 => "h2",
+        crate::doc::Style::Heading3 => "h3",
+        _ => "p",
+    };
+    let line = match p.line_rule {
+        LineRule::Auto => format!("{}", p.line_spacing),
+        _ => format!("{}pt", p.line_spacing),
+    };
+    let mut style = format!(
+        "margin:{}pt {}pt {}pt {}pt;text-indent:{}pt;text-align:{};line-height:{};font-weight:normal;",
+        p.space_before, p.ind_right, p.space_after, p.ind_left, p.ind_first, align, line
+    );
+    if p.shading[3] > 0 {
+        style.push_str(&format!("background:#{};", hex(p.shading)));
+    }
+    if p.page_break_before {
+        style.push_str("break-before:page;");
+    }
+    h.push_str(&format!("<{tag} style=\"{style}\">"));
+    if let Some(l) = label {
+        h.push_str(&format!(
+            "<span style=\"{}display:inline-block;min-width:18pt;text-indent:0\">{}</span>",
+            css_fmt(&p.fmt_at(0)),
+            html_esc(l)
+        ));
+    }
+    if p.chars.is_empty() {
+        h.push_str(&format!("<span style=\"{}\">&#8203;</span>", css_fmt(&p.end_fmt)));
+    }
+    let mut page_break = false;
+    let mut open_link = 0;
+    for (text, f) in runs(p) {
+        if f.link != open_link {
+            if open_link != 0 {
+                h.push_str("</a>");
+            }
+            open_link = f.link;
+            if open_link != 0 {
+                let (url, anchor) = pool::link(open_link);
+                let href = if url.is_empty() { format!("#{anchor}") } else { url };
+                h.push_str(&format!("<a href=\"{}\">", html_esc(&href)));
+            }
+        }
+        if f.hidden {
+            continue;
+        }
+        if f.image != 0 {
+            if let Some(img) = doc.images.get(&f.image) {
+                let (_, mime) = image_kind(&img.bytes);
+                h.push_str(&format!(
+                    "<img src=\"data:{};base64,{}\" style=\"width:{}pt;height:{}pt;vertical-align:bottom\">",
+                    mime,
+                    b64.encode(img.bytes.as_slice()),
+                    img.w,
+                    img.h
+                ));
+            }
+            continue;
+        }
+        if f.obj != 0 {
+            if let Some(o) = pool::obj(f.obj) {
+                match o.kind {
+                    ObjKind::Label(t) => h.push_str(&format!("<span style=\"{}\">{}</span>", css_fmt(&f), html_esc(&t))),
+                    ObjKind::Box { label, w, h: bh } => h.push_str(&format!(
+                        "<span style=\"display:inline-block;width:{w}pt;height:{bh}pt;border:1px dashed #999;color:#777;font-size:9pt;text-align:center\">{}</span>",
+                        html_esc(&label)
+                    )),
+                    _ => {}
+                }
+            }
+            continue;
+        }
+        let mut t = String::new();
+        for c in text.chars() {
+            match c {
+                LINE_BREAK => t.push_str("<br>"),
+                PAGE_BREAK => page_break = true,
+                '\t' => t.push_str("&emsp;&emsp;"),
+                c => t.push_str(&html_esc(&c.to_string())),
+            }
+        }
+        h.push_str(&format!("<span style=\"{}\">{}</span>", css_fmt(&f), t));
+    }
+    if open_link != 0 {
+        h.push_str("</a>");
+    }
+    h.push_str(&format!("</{tag}>"));
+    if page_break {
+        h.push_str("<div class=\"pb\"></div>");
+    }
+}
+
+pub fn to_html(doc: &Document, title: &str, print: bool) -> String {
     let [mt, mr, mb, ml] = doc.page.margins;
     let mut h = String::new();
     h.push_str("<!DOCTYPE html>\n<html><head><meta charset=\"utf-8\">\n");
@@ -356,9 +676,9 @@ pub fn to_html(doc: &Document, title: &str, print: bool) -> String {
         "@page {{ size: {}pt {}pt; margin: {}pt {}pt {}pt {}pt; }}\n",
         doc.page.width, doc.page.height, mt, mr, mb, ml
     ));
-    h.push_str("body { margin: 0 auto; max-width: ");
-    h.push_str(&format!("{}pt; }}\n", doc.page.width - ml - mr));
-    h.push_str("p { margin: 0; white-space: pre-wrap; }\nul, ol { margin: 0; }\n");
+    h.push_str(&format!("body {{ margin: 0 auto; max-width: {}pt; }}\n", doc.page.width - ml - mr));
+    h.push_str("p, h1, h2, h3 { margin: 0; white-space: pre-wrap; }\n");
+    h.push_str("table { border-collapse: collapse; }\ntd { vertical-align: top; padding: 0 5.4pt; }\n");
     h.push_str(".pb { page-break-after: always; break-after: page; }\n");
     h.push_str("</style>\n");
     if print {
@@ -368,75 +688,40 @@ pub fn to_html(doc: &Document, title: &str, print: bool) -> String {
     if !doc.header.is_empty() {
         h.push_str(&format!("<div style=\"text-align:center;color:#666\">{}</div>\n", html_esc(&doc.header)));
     }
-    let labels = crate::doc::list_labels(&doc.paras);
-    for (p, label) in doc.paras.iter().zip(labels) {
-        let align = match p.align {
-            Align::Left => "left",
-            Align::Center => "center",
-            Align::Right => "right",
-            Align::Justify => "justify",
-        };
-        let mut indent = p.level as f32 * 36.0;
-        if p.style == Style::Quote {
-            indent += 36.0;
-        }
-        let tag = match p.style {
-            Style::Title | Style::Heading1 => "h1",
-            Style::Heading2 => "h2",
-            Style::Heading3 => "h3",
-            _ => "p",
-        };
-        let mut style = format!(
-            "margin:{}pt 0 {}pt {}pt;text-align:{};line-height:{};font-weight:normal;",
-            p.space_before, p.space_after, indent, align, p.line_spacing
-        );
-        if p.style == Style::Code {
-            style.push_str("background:#f3f3f3;");
-        }
-        if label.is_some() {
-            style.push_str(&format!("padding-left:18pt;text-indent:-18pt;margin-left:{}pt;", indent));
-        }
-        h.push_str(&format!("<{tag} style=\"{style}\">"));
-        if let Some(l) = &label {
-            h.push_str(&format!(
-                "<span style=\"{}display:inline-block;width:18pt;text-indent:0\">{}</span>",
-                css_fmt(&p.fmt_at(0)),
-                html_esc(l)
-            ));
-        }
-        if p.chars.is_empty() {
-            h.push_str(&format!("<span style=\"{}\">&#8203;</span>", css_fmt(&p.end_fmt)));
-        }
-        let mut page_break = false;
-        for (text, f) in runs(p) {
-            if f.image != 0 {
-                if let Some(img) = doc.images.get(&f.image) {
-                    let (_, mime) = image_kind(&img.bytes);
-                    h.push_str(&format!(
-                        "<img src=\"data:{};base64,{}\" style=\"width:{}pt;height:{}pt;vertical-align:bottom\">",
-                        mime,
-                        b64.encode(img.bytes.as_slice()),
-                        img.w,
-                        img.h
-                    ));
+    let labels = doc.list_labels();
+    let mut i = 0;
+    while i < doc.paras.len() {
+        let p = &doc.paras[i];
+        if let Some(c) = p.cell {
+            let t = doc.tables.get(&c.table).cloned().unwrap_or_default();
+            let border = if t.borders { "border:1px solid #000;" } else { "" };
+            h.push_str("<table>");
+            let range = doc.table_range(c.table);
+            let mut k = range.start;
+            while k < range.end {
+                let row = doc.paras[k].cell.unwrap().row;
+                h.push_str("<tr>");
+                while k < range.end && doc.paras[k].cell.unwrap().row == row {
+                    let cref = doc.paras[k].cell.unwrap();
+                    let cp = t.cell(cref.row, cref.col);
+                    let w: f32 = t.grid.iter().skip(cref.col as usize).take(cp.span.max(1) as usize).sum();
+                    let bg = cp.shade.map(|s| format!("background:#{};", hex(s))).unwrap_or_default();
+                    h.push_str(&format!("<td colspan=\"{}\" style=\"{border}{bg}width:{w}pt\">", cp.span.max(1)));
+                    while k < range.end && doc.paras[k].cell == Some(cref) {
+                        para_html(doc, &doc.paras[k], labels[k].as_ref(), &mut h);
+                        k += 1;
+                    }
+                    h.push_str("</td>");
                 }
-                continue;
+                h.push_str("</tr>");
             }
-            let mut t = String::new();
-            for c in text.chars() {
-                match c {
-                    LINE_BREAK => t.push_str("<br>"),
-                    PAGE_BREAK => page_break = true,
-                    '\t' => t.push_str("&emsp;&emsp;"),
-                    c => t.push_str(&html_esc(&c.to_string())),
-                }
-            }
-            h.push_str(&format!("<span style=\"{}\">{}</span>", css_fmt(&f), t));
+            h.push_str("</table>\n");
+            i = range.end;
+            continue;
         }
-        h.push_str(&format!("</{tag}>\n"));
-        if page_break {
-            h.push_str("<div class=\"pb\"></div>\n");
-        }
+        para_html(doc, p, labels[i].as_ref(), &mut h);
+        h.push('\n');
+        i += 1;
     }
     if !doc.footer.is_empty() {
         h.push_str(&format!("<div style=\"text-align:center;color:#666\">{}</div>\n", html_esc(&doc.footer)));
