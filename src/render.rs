@@ -138,6 +138,10 @@ fn draw_content<C: Canvas>(
     mut under: impl FnMut(&mut C, usize),
 ) {
     let sc = lay.scale;
+    // Floating objects behind the text.
+    for f in lay.floats.iter().filter(|f| f.page == page && f.behind) {
+        draw_float(c, doc, f, sc);
+    }
     // Table cell shading.
     for cell in lay.cells.iter().filter(|b| b.page == page) {
         if let Some(s) = cell.shade {
@@ -182,6 +186,23 @@ fn draw_content<C: Canvas>(
         border(c, x0, y1, x1, y1, &b, sc);
         border(c, x0, y0, x0, y1, &l, sc);
     }
+    // Floating objects in front of the text.
+    for f in lay.floats.iter().filter(|f| f.page == page && !f.behind) {
+        draw_float(c, doc, f, sc);
+    }
+}
+
+/// Draws a floating picture, or a placeholder for other floating objects.
+fn draw_float<C: Canvas>(c: &mut C, doc: &Document, f: &layout::FloatBox, sc: f32) {
+    if f.image != 0 && doc.images.contains_key(&f.image) {
+        c.image(f.image, f.x, f.y, f.w, f.h);
+        return;
+    }
+    let grey: Rgba = [0x99, 0x99, 0x99, 255];
+    dashed_rect(c, f.x, f.y, f.w, f.h, grey);
+    let lf = CharFmt { size: 9.0, color: [0x66, 0x66, 0x66, 255], ..CharFmt::body() };
+    let text: String = f.label.chars().take(((f.w / (5.0 * sc)) as usize).max(3)).collect();
+    c.text(f.x + 4.0 * sc, f.y + 12.0 * sc, &text, &lf, 9.0 * sc);
 }
 
 /// Draws one border line (axis-aligned) in its style.
@@ -288,14 +309,17 @@ fn draw_line<C: Canvas>(c: &mut C, doc: &Document, lay: &Layout, l: &Line, page_
         }
         if f.image != 0 {
             if let Some(img) = doc.images.get(&f.image) {
-                c.image(f.image, x0, base - img.h * sc, img.w * sc, img.h * sc);
+                if img.anchor.is_none() {
+                    c.image(f.image, x0, base - img.h * sc, img.w * sc, img.h * sc);
+                }
             }
             continue;
         }
         if f.obj != 0 {
             let Some(o) = pool::obj(f.obj) else { continue };
             match &o.kind {
-                ObjKind::Box { label, w, h } => {
+                ObjKind::Box { anchor: Some(_), .. } => {}
+                ObjKind::Box { label, w, h, .. } => {
                     let (w, h) = (w * sc, h * sc);
                     let top = base - h;
                     c.rect(x0, top, w, h, [0xF4, 0xF4, 0xF4, 255]);

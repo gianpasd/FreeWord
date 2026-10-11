@@ -396,6 +396,7 @@ impl Reader<'_> {
                             img.h = h;
                         }
                     }
+                    img.anchor = parse_anchor(c);
                     img.raw = Some((raw, self.pkg));
                     let id = self.images.keys().next_back().copied().unwrap_or(self.image_base).max(self.image_base) + 1;
                     self.images.insert(id, img);
@@ -423,12 +424,14 @@ impl Reader<'_> {
             "Shape".into()
         };
         let (w, h) = size.unwrap_or((72.0, 36.0));
-        let anchored = raw.contains("wp:anchor") || raw.contains("mso-position");
-        // Floating objects with zero size, or behind-text decorations, take no space.
+        let anchor = parse_anchor(c);
+        // Zero-size objects take no space.
         let kind = if w < 1.0 || h < 1.0 {
             ObjKind::Hidden
+        } else if anchor.is_some() {
+            ObjKind::Box { label, w, h, anchor }
         } else {
-            ObjKind::Box { label, w: w.min(468.0), h: if anchored { h.min(200.0) } else { h.min(600.0) } }
+            ObjKind::Box { label, w: w.min(468.0), h: h.min(600.0), anchor: None }
         };
         self.push_obj(p, f, raw, kind);
     }
@@ -681,6 +684,43 @@ fn collect_named<'a>(el: &'a El, name: &str, transparent: &[&str], out: &mut Vec
             collect_named(c, name, transparent, out);
         }
     }
+}
+
+/// Placement of a DrawingML `wp:anchor` (None for inline objects).
+pub(crate) fn parse_anchor(c: &El) -> Option<crate::doc::Anchor> {
+    use crate::doc::{Anchor, HRel, PosSpec, VRel, Wrap};
+    let a = c.find("anchor")?;
+    let emu = |e: &El| e.child("posOffset").and_then(|o| o.text().trim().parse::<f32>().ok()).map(|v| v / 12700.0);
+    let align = |e: &El| -> Option<PosSpec> {
+        Some(match e.child("align")?.text().trim() {
+            "left" | "top" | "inside" => PosSpec::Start,
+            "center" => PosSpec::Center,
+            _ => PosSpec::End,
+        })
+    };
+    let (mut h_rel, mut h_pos) = (HRel::Column, PosSpec::Offset(0.0));
+    if let Some(h) = a.child("positionH") {
+        h_rel = match h.attr("relativeFrom") {
+            Some("page" | "leftMargin" | "outsideMargin") => HRel::Page,
+            Some("margin" | "insideMargin" | "rightMargin") => HRel::Margin,
+            Some("character") => HRel::Character,
+            _ => HRel::Column,
+        };
+        h_pos = align(h).or(emu(h).map(PosSpec::Offset)).unwrap_or(PosSpec::Offset(0.0));
+    }
+    let (mut v_rel, mut v_pos) = (VRel::Paragraph, PosSpec::Offset(0.0));
+    if let Some(v) = a.child("positionV") {
+        v_rel = match v.attr("relativeFrom") {
+            Some("page" | "topMargin") => VRel::Page,
+            Some("margin" | "bottomMargin" | "insideMargin" | "outsideMargin") => VRel::Margin,
+            Some("line") => VRel::Line,
+            _ => VRel::Paragraph,
+        };
+        v_pos = align(v).or(emu(v).map(PosSpec::Offset)).unwrap_or(PosSpec::Offset(0.0));
+    }
+    let wrap = if a.child("wrapNone").is_some() { Wrap::None } else { Wrap::Clear };
+    let behind = matches!(a.attr("behindDoc"), Some("1" | "true"));
+    Some(Anchor { h_rel, h_pos, v_rel, v_pos, wrap: if behind { Wrap::None } else { wrap }, behind })
 }
 
 fn vml_size(style: &str) -> Option<(f32, f32)> {

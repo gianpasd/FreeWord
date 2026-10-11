@@ -287,6 +287,52 @@ pub struct CellRef {
     pub col: u32,
 }
 
+/// What a floating object's horizontal position is measured from.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub enum HRel {
+    Page,
+    Margin,
+    Column,
+    Character,
+}
+
+/// What a floating object's vertical position is measured from.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub enum VRel {
+    Page,
+    Margin,
+    Paragraph,
+    Line,
+}
+
+/// Position along one axis: an offset in points or an alignment.
+#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
+pub enum PosSpec {
+    Offset(f32),
+    Start,
+    Center,
+    End,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub enum Wrap {
+    /// In front of / behind text.
+    None,
+    /// Text keeps clear of the object (square, tight, through, top and bottom).
+    Clear,
+}
+
+/// Placement of a floating (anchored) picture or shape.
+#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
+pub struct Anchor {
+    pub h_rel: HRel,
+    pub h_pos: PosSpec,
+    pub v_rel: VRel,
+    pub v_pos: PosSpec,
+    pub wrap: Wrap,
+    pub behind: bool,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum BorderKind {
     None,
@@ -665,6 +711,8 @@ pub struct ImageData {
     /// Original drawing XML (anchoring, effects...) from a .docx, and the
     /// package it came from.
     pub raw: Option<(String, u64)>,
+    /// Floating placement; None for inline pictures.
+    pub anchor: Option<Anchor>,
 }
 
 /// The original .docx package a document was opened from.

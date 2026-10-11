@@ -48,7 +48,13 @@ pub enum ObjKind {
     /// Shown as text (equations, symbols...).
     Label(String),
     /// Shown as a framed box of the given size in points (charts, shapes...).
-    Box { label: String, w: f32, h: f32 },
+    Box {
+        label: String,
+        w: f32,
+        h: f32,
+        #[serde(default)]
+        anchor: Option<crate::doc::Anchor>,
+    },
     FieldBegin,
     FieldSep,
     FieldEnd,

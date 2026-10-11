@@ -252,9 +252,16 @@ impl App {
 
     /// Screen rectangle of a picture character (page-relative).
     fn image_box(&self, lay: &Layout, pos: Pos) -> Option<(usize, Rect)> {
+        // Floating pictures live at their anchored position.
+        if let Some(fb) = lay.floats.iter().find(|f| f.para == pos.p && f.off == pos.o && f.image != 0) {
+            return Some((fb.page, Rect::from_min_size(pos2(fb.x, fb.y), vec2(fb.w, fb.h))));
+        }
         let para = self.doc.paras.get(pos.p)?;
         let f = para.fmts.get(pos.o)?;
         let img = self.doc.images.get(&f.image)?;
+        if img.anchor.is_some() {
+            return None;
+        }
         let l = &lay.lines[lay.line_of(pos)];
         if pos.o < l.start || pos.o >= l.end {
             return None;
@@ -369,8 +376,17 @@ impl App {
                         // Clicking a picture selects it.
                         let o = self.page_origin(rect, lay, page);
                         let local = p - o.to_vec2();
-                        let img_hit = [pos, self.doc.prev(pos)].into_iter().find(|cand| {
-                            self.image_box(lay, *cand).is_some_and(|(pg, r)| pg == page && r.contains(local))
+                        // Floating objects first (topmost last in the list), then inline pictures.
+                        let float_hit = lay
+                            .floats
+                            .iter()
+                            .rev()
+                            .find(|f| f.page == page && Rect::from_min_size(pos2(f.x, f.y), vec2(f.w, f.h)).contains(local))
+                            .map(|f| Pos::new(f.para, f.off));
+                        let img_hit = float_hit.or_else(|| {
+                            [pos, self.doc.prev(pos)].into_iter().find(|cand| {
+                                self.image_box(lay, *cand).is_some_and(|(pg, r)| pg == page && r.contains(local))
+                            })
                         });
                         if let (Some(ip), false) = (img_hit, shift) {
                             let next = self.doc.next(ip);
@@ -659,8 +675,10 @@ impl App {
                     if f.image == 0 || !(has_sel && sa == Pos::new(l.para, k) && sb == Pos::new(l.para, k + 1)) {
                         continue;
                     }
-                    if let Some(img) = self.doc.images.get(&f.image) {
-                        let r = Rect::from_min_size(pos2(x_of(k), base - img.h * sc), vec2(img.w * sc, img.h * sc));
+                    if let Some((pg, ir)) = self.image_box(lay, Pos::new(l.para, k)) {
+                        let po = self.page_origin(rect, lay, pg);
+                        let r = ir.translate(po.to_vec2());
+                        let _ = base;
                         let blue = Color32::from_rgb(0x2B, 0x57, 0x9A);
                         painter.rect_stroke(r, 0.0, Stroke::new(1.0, blue), StrokeKind::Outside);
                         let h = Rect::from_center_size(r.max, vec2(8.0, 8.0));

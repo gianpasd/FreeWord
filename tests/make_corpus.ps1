@@ -241,6 +241,25 @@ try {
     $s.ParagraphFormat.Shading.BackgroundPatternColor = -16777216
     Para $s "Plain paragraph after the box."
     Save-Doc $d "09_table_styles.docx"
+
+    # 10. Floating pictures with different wrapping
+    $d = New-Doc; $s = $word.Selection
+    Para $s "Floating pictures" "Heading 1"
+    $s.Style = "Normal"
+    for ($i = 0; $i -lt 6; $i++) { Para $s ("Body text that flows around floating objects. " * 8) }
+    if ($Image -and (Test-Path $Image)) {
+        $img = (Resolve-Path $Image).Path
+        $anchor = $d.Paragraphs.Item(3).Range
+        $p1 = $d.Shapes.AddPicture($img, $false, $true, 300, 20, 150, 110, $anchor)
+        $p1.WrapFormat.Type = 4      # top and bottom
+        $anchor = $d.Paragraphs.Item(5).Range
+        $p2 = $d.Shapes.AddPicture($img, $false, $true, 20, 10, 120, 90, $anchor)
+        $p2.WrapFormat.Type = 5      # behind text
+        $anchor = $d.Paragraphs.Item(6).Range
+        $p3 = $d.Shapes.AddPicture($img, $false, $true, 330, 30, 110, 80, $anchor)
+        $p3.WrapFormat.Type = 3      # in front of text
+    }
+    Save-Doc $d "10_floating.docx"
 }
 finally {
     $word.Quit()

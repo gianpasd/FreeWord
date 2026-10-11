@@ -87,6 +87,8 @@ pub struct Layout {
     pub notes: Vec<NoteBox>,
     /// Note separator lines: (page, y).
     pub note_separators: Vec<(usize, f32)>,
+    /// Floating pictures and shapes.
+    pub floats: Vec<FloatBox>,
 }
 
 type BTreeMapPages = std::collections::BTreeMap<usize, Vec<((bool, String), Box<Layout>, f32)>>;
@@ -318,6 +320,9 @@ impl Ctx<'_, '_> {
             }
             if f.image != 0 {
                 if let Some(img) = doc.images.get(&f.image) {
+                    if img.anchor.is_some() {
+                        continue;
+                    }
                     widths[i] = img.w * sc;
                     asc[i] = img.h * sc;
                     is_img[i] = true;
@@ -327,6 +332,7 @@ impl Ctx<'_, '_> {
             if f.obj != 0 {
                 if let Some(o) = pool::obj(f.obj) {
                     match &o.kind {
+                        ObjKind::Box { anchor: Some(_), .. } => {}
                         ObjKind::Box { w, h, .. } => {
                             widths[i] = w * sc;
                             asc[i] = h * sc;
@@ -634,6 +640,8 @@ struct Pager {
     max_y: f32,
     /// Move to the next column (column break).
     force_col: bool,
+    /// Vertical ranges (relative to the top margin) kept clear by floating objects on this page.
+    bands: Vec<(f32, f32)>,
 }
 
 impl Pager {
@@ -650,10 +658,19 @@ impl Pager {
         self.max_y = 0.0;
         self.force = false;
         self.force_col = false;
+        self.bands.clear();
     }
 
     /// Places a block of height `h` that brings `notes` of footnote height with it.
     fn place_with(&mut self, h: f32, notes: f32) -> (usize, f32) {
+        // Skip past floating objects that text must keep clear of.
+        for _ in 0..8 {
+            let hit = self.bands.iter().copied().find(|&(t, b)| self.y < b && self.y + h > t && !self.force);
+            match hit {
+                Some((_, b)) => self.y = b,
+                None => break,
+            }
+        }
         let full = self.y + h + self.notes_h + notes > self.content_h && self.y > self.col_top;
         if self.force {
             self.new_page();
@@ -762,6 +779,97 @@ thread_local! {
     static NOTE_SELF: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
 }
 
+/// A floating picture or shape placed on a page.
+pub struct FloatBox {
+    pub page: usize,
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    /// Anchor character.
+    pub para: usize,
+    pub off: usize,
+    pub behind: bool,
+    /// Text keeps clear of the object.
+    pub clear: bool,
+    pub image: u32,
+    pub label: String,
+}
+
+/// Reference areas for positioning floats.
+struct Frame {
+    pw: f32,
+    ph: f32,
+    margins: [f32; 4],
+    col_left: f32,
+    col_w: f32,
+    sc: f32,
+}
+
+/// Anchored object of a character: (anchor, width pt, height pt, label).
+fn anchored(doc: &Document, f: &CharFmt) -> Option<(doc::Anchor, f32, f32, String)> {
+    if f.image != 0 {
+        let img = doc.images.get(&f.image)?;
+        return img.anchor.map(|a| (a, img.w, img.h, String::new()));
+    }
+    match pool::obj(f.obj)?.kind {
+        ObjKind::Box { anchor: Some(a), w, h, label } => Some((a, w, h, label)),
+        _ => None,
+    }
+}
+
+/// Floats anchored on a placed line.
+fn floats_on_line(doc: &Document, pi: usize, l: &Line, para_top: f32, fr: &Frame) -> Vec<FloatBox> {
+    use doc::{HRel, PosSpec, VRel};
+    let para = &doc.paras[pi];
+    let sc = fr.sc;
+    let [mt, mr, mb, ml] = fr.margins;
+    let mut out = Vec::new();
+    for k in l.start..l.end {
+        let f = para.fmts[k];
+        let Some((a, w, h, label)) = anchored(doc, &f) else { continue };
+        let (w, h) = (w * sc, h * sc);
+        let (fx, fw) = match a.h_rel {
+            HRel::Page => (0.0, fr.pw),
+            HRel::Margin => (ml, fr.pw - ml - mr),
+            HRel::Column => (fr.col_left, fr.col_w),
+            HRel::Character => (l.xs[k - l.start], 0.0),
+        };
+        let x = match a.h_pos {
+            PosSpec::Offset(o) => fx + o * sc,
+            PosSpec::Start => fx,
+            PosSpec::Center => fx + (fw - w) / 2.0,
+            PosSpec::End => fx + fw - w,
+        };
+        let (fy, fh) = match a.v_rel {
+            VRel::Page => (0.0, fr.ph),
+            VRel::Margin => (mt, fr.ph - mt - mb),
+            VRel::Paragraph => (para_top, 0.0),
+            VRel::Line => (l.y, l.height),
+        };
+        let y = match a.v_pos {
+            PosSpec::Offset(o) => fy + o * sc,
+            PosSpec::Start => fy,
+            PosSpec::Center => fy + (fh - h) / 2.0,
+            PosSpec::End => fy + fh - h,
+        };
+        out.push(FloatBox {
+            page: l.page,
+            x,
+            y,
+            w,
+            h,
+            para: pi,
+            off: k,
+            behind: a.behind,
+            clear: a.wrap == doc::Wrap::Clear,
+            image: f.image,
+            label,
+        });
+    }
+    out
+}
+
 /// A laid-out footnote or endnote.
 pub struct NoteBox {
     pub page: usize,
@@ -849,7 +957,10 @@ pub fn layout(doc: &Document, fonts: &mut FontsView<'_>, zoom: f32) -> Layout {
         col_top: 0.0,
         max_y: 0.0,
         force_col: false,
+        bands: Vec::new(),
     };
+    let mut floats: Vec<FloatBox> = Vec::new();
+    let page_margins = doc.page.margins.map(|m| m * sc);
     // Footnotes per page: (page, key, layout, height).
     let mut page_notes: Vec<(usize, (bool, String), Box<Layout>, f32)> = Vec::new();
     let mut lines: Vec<Line> = Vec::new();
@@ -982,9 +1093,12 @@ pub fn layout(doc: &Document, fonts: &mut FontsView<'_>, zoom: f32) -> Layout {
                     };
                     for (idx, pl, py) in paras_in_cell {
                         let first_line = lines.len();
+                        let para_top = top + py + dy;
                         for mut l in pl.lines {
                             l.page = page;
                             l.y += top + py + dy;
+                            let fr = Frame { pw, ph, margins: page_margins, col_left: pl.left, col_w: pl.right - pl.left, sc };
+                            floats.extend(floats_on_line(doc, idx, &l, para_top, &fr));
                             lines.push(l);
                         }
                         boxes[idx] = Some(ParaBox { lines: first_line..lines.len(), left: pl.left, right: pl.right, marker: pl.marker });
@@ -1016,6 +1130,27 @@ pub fn layout(doc: &Document, fonts: &mut FontsView<'_>, zoom: f32) -> Layout {
         let pl = ctx.para(doc, pi, labels[pi].as_ref(), ml, ml + col_w);
         let first_line = lines.len();
         let mut first_shift = None;
+        // Floats are positioned relative to where the paragraph starts, before its
+        // own lines are placed, so the paragraph itself can flow around them.
+        {
+            let first_h = pl.lines.first().map(|l| l.height).unwrap_or(0.0);
+            let next_page = pager.force || (pager.y + first_h + pager.notes_h > pager.content_h && pager.y > pager.col_top);
+            let (est_page, est_top) = if next_page { (pager.page + 1, pager.mt) } else { (pager.page, pager.mt + pager.y) };
+            let shift = pager.col as f32 * (col_w + gap * sc);
+            let fr = Frame { pw, ph, margins: page_margins, col_left: ml + shift, col_w, sc };
+            let mut y = est_top;
+            for l in &pl.lines {
+                let mut est = Line { page: est_page, y, xs: l.xs.iter().map(|x| x + shift).collect(), leaders: Vec::new(), ..*l };
+                est.para = pi;
+                for fb in floats_on_line(doc, pi, &est, est_top, &fr) {
+                    if fb.clear && fb.page == pager.page {
+                        pager.bands.push((fb.y - mt - 2.0 * sc, fb.y + fb.h - mt + 4.0 * sc));
+                    }
+                    floats.push(fb);
+                }
+                y += l.height;
+            }
+        }
         for mut l in pl.lines {
             // Footnotes referenced on this line must fit on the same page.
             let mut new_notes = Vec::new();
@@ -1195,6 +1330,7 @@ pub fn layout(doc: &Document, fonts: &mut FontsView<'_>, zoom: f32) -> Layout {
         page_fields: find_page_fields(doc),
         notes,
         note_separators: separators,
+        floats,
     }
 }
 

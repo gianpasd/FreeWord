@@ -49,7 +49,7 @@ pub fn image_from_bytes(bytes: Vec<u8>, max_w: f32) -> Result<ImageData, String>
         dh *= max_w / dw;
         dw = max_w;
     }
-    Ok(ImageData { bytes: Arc::new(bytes), px_w: w, px_h: h, w: dw, h: dh, raw: None })
+    Ok(ImageData { bytes: Arc::new(bytes), px_w: w, px_h: h, w: dw, h: dh, raw: None, anchor: None })
 }
 
 // ---------------------------------------------------------------- native
@@ -364,6 +364,7 @@ pub fn load_native(path: &Path) -> Result<Document, String> {
                 data.w = im.w;
                 data.h = im.h;
                 data.raw = im.raw.map(|r| (r, pkg_id));
+                data.anchor = data.raw.as_ref().and_then(|(r, _)| crate::xml::parse(r).ok()).and_then(|e| crate::docx::parse_anchor(&e));
                 doc.images.insert(im.id, data);
             }
         }
@@ -644,7 +645,7 @@ fn para_html(doc: &Document, p: &Para, label: Option<&String>, h: &mut String) {
             if let Some(o) = pool::obj(f.obj) {
                 match o.kind {
                     ObjKind::Label(t) => h.push_str(&format!("<span style=\"{}\">{}</span>", css_fmt(&f), html_esc(&t))),
-                    ObjKind::Box { label, w, h: bh } => h.push_str(&format!(
+                    ObjKind::Box { label, w, h: bh, .. } => h.push_str(&format!(
                         "<span style=\"display:inline-block;width:{w}pt;height:{bh}pt;border:1px dashed #999;color:#777;font-size:9pt;text-align:center\">{}</span>",
                         html_esc(&label)
                     )),
