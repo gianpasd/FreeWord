@@ -1,4 +1,4 @@
-//! Line breaking, table layout and pagination.
+﻿//! Line breaking, table layout and pagination.
 //!
 //! All coordinates produced here are in screen points relative to the top-left
 //! corner of the page the line lives on.
@@ -42,6 +42,9 @@ pub struct Line {
     pub forced: bool,
     /// Tab characters (paragraph offsets) drawn with a leader.
     pub leaders: Vec<(usize, Leader)>,
+    /// Extra space of multiple line spacing below the text; at the bottom of a
+    /// page it may hang into the margin, as in Word.
+    pub leading: f32,
 }
 
 #[derive(Clone)]
@@ -399,12 +402,16 @@ fn metrics(fonts: &mut FontsView<'_>, cache: &mut MetricCache, id: &FontId) -> (
     if let Some(m) = cache.get(&key) {
         return *m;
     }
-    let g = fonts.layout_no_wrap("Hg".into(), id.clone(), Color32::BLACK);
-    let h = g.size().y;
+    // Measured at 16x and scaled down: egui snaps metrics to whole pixels, which
+    // would make 11pt Calibri lines 13pt instead of Word's 13.43pt.
+    const K: f32 = 16.0;
+    let big = FontId { size: id.size * K, family: id.family.clone() };
+    let g = fonts.layout_no_wrap("Hg".into(), big, Color32::BLACK);
+    let h = g.size().y / K;
     let asc = g
         .rows
         .first()
-        .and_then(|r| r.row.glyphs.first().map(|gl| r.pos.y + gl.pos.y))
+        .and_then(|r| r.row.glyphs.first().map(|gl| (r.pos.y + gl.pos.y) / K))
         .unwrap_or(h * 0.8);
     cache.insert(key, (asc, h));
     (asc, h)
@@ -460,7 +467,7 @@ impl Ctx<'_, '_> {
         let para = &doc.paras[pi];
         let n = para.len();
         let left = left_edge + para.ind_left * sc;
-        let right = (right_edge - para.ind_right * sc).max(left + 20.0);
+        let right = (right_edge - para.ind_right * sc).max(left);
         let first_x = left + para.ind_first * sc;
 
         // Per-character metrics.
@@ -587,7 +594,7 @@ impl Ctx<'_, '_> {
         loop {
             let line_start = i;
             let x0 = if lines.is_empty() { first_text_x } else { left };
-            let avail = (right - x0).max(10.0);
+            let avail = (right - x0).max(0.0);
             let mut x = 0.0f32;
             let mut last_break: Option<usize> = None;
             let mut ws: Vec<f32> = Vec::new();
@@ -641,7 +648,9 @@ impl Ctx<'_, '_> {
                 } else {
                     widths[j]
                 };
-                if x + w > avail && j > line_start && c != ' ' && !para.fmts[j].hidden {
+                // Spaces may hang past the margin, unless the line already overflows
+                // (Word puts one character per line in a column narrower than that).
+                if x + w > avail && j > line_start && (c != ' ' || x > avail) && !para.fmts[j].hidden {
                     match last_break {
                         Some(b) => {
                             end = b;
@@ -684,8 +693,9 @@ impl Ctx<'_, '_> {
                 d = end_d;
                 text_h = a + d;
             }
+            let leading = if para.line_rule == LineRule::Auto { text_h * (para.line_spacing - 1.0).max(0.0) } else { 0.0 };
             let (height, baseline) = match para.line_rule {
-                LineRule::Auto => (a + d + text_h * (para.line_spacing - 1.0).max(0.0), a),
+                LineRule::Auto => (a + d + leading, a),
                 LineRule::Exact => {
                     let h = (para.line_spacing * sc).max(1.0);
                     (h, (h - d).max(0.0))
@@ -749,10 +759,13 @@ impl Ctx<'_, '_> {
                 last_in_para: false,
                 forced: forced.is_some(),
                 leaders,
+                leading,
             });
             y += height;
             i = end;
-            if i >= n && forced.is_none() {
+            // Nothing follows a page break at the end of a paragraph: Word shows its
+            // paragraph mark beside the break, not on the next page.
+            if i >= n && forced != Some(LINE_BREAK) {
                 break;
             }
         }
@@ -809,7 +822,7 @@ struct Pager {
 
 impl Pager {
     fn place(&mut self, h: f32) -> (usize, f32) {
-        self.place_with(h, 0.0)
+        self.place_with(h, 0.0, 0.0)
     }
 
     fn new_page(&mut self) {
@@ -825,7 +838,8 @@ impl Pager {
     }
 
     /// Places a block of height `h` that brings `notes` of footnote height with it.
-    fn place_with(&mut self, h: f32, notes: f32) -> (usize, f32) {
+    /// `hang` is the part of `h` that may extend into the bottom margin.
+    fn place_with(&mut self, h: f32, notes: f32, hang: f32) -> (usize, f32) {
         // Skip past floating objects that text must keep clear of.
         for _ in 0..8 {
             let hit = self.bands.iter().copied().find(|&(t, b)| self.y < b && self.y + h > t && !self.force);
@@ -834,7 +848,7 @@ impl Pager {
                 None => break,
             }
         }
-        let full = self.y + h + self.notes_h + notes > self.content_h && self.y > self.col_top;
+        let full = self.y + h - hang + self.notes_h + notes > self.content_h && self.y > self.col_top;
         if self.force {
             self.new_page();
         } else if full || self.force_col {
@@ -1150,6 +1164,9 @@ pub fn layout(doc: &Document, fonts: &mut FontsView<'_>, zoom: f32) -> Layout {
     let mut boxes: Vec<Option<ParaBox>> = (0..doc.paras.len()).map(|_| None).collect();
     let mut cells: Vec<CellBox> = Vec::new();
     let mut pending_after = 0.0f32;
+    // Space after of an empty section-break paragraph at the top of a page, which
+    // Word subtracts from the next paragraph's space before.
+    let mut top_after = 0.0f32;
     // Index of the first line of each section after the first.
     let mut section_starts: Vec<usize> = Vec::new();
     let sects = doc.section_props();
@@ -1196,6 +1213,33 @@ pub fn layout(doc: &Document, fonts: &mut FontsView<'_>, zoom: f32) -> Layout {
             let tedges = table.display_edges();
             let ncols = table.grid.len().max(1) as u32;
             let last_row = doc.paras[range.end - 1].cell.unwrap().row;
+            // Resolved borders of a cell: top, right, bottom, left.
+            let edges_of = |cref: doc::CellRef| -> [Option<doc::Border>; 4] {
+                let cp = table.cell(cref.row, cref.col);
+                let span = cp.span.max(1);
+                // Imported cells carry resolved edges; generated tables use the table's.
+                let mut edges = if cp.edges.iter().any(|e| e.is_some()) {
+                    cp.edges
+                } else {
+                    [
+                        if cref.row == 0 { tedges.top } else { tedges.inside_h },
+                        if cref.col + span >= ncols { tedges.right } else { tedges.inside_v },
+                        if cref.row == last_row { tedges.bottom } else { tedges.inside_h },
+                        if cref.col == 0 { tedges.left } else { tedges.inside_v },
+                    ]
+                };
+                if cp.vmerge == VMerge::Continue {
+                    edges[0] = None;
+                }
+                if cp.vmerge != VMerge::None && table.cells.get(&(cref.row + 1, cref.col)).is_some_and(|n| n.vmerge == VMerge::Continue) {
+                    edges[2] = None;
+                }
+                edges
+            };
+            let border_w = |b: &Option<doc::Border>| if doc::Border::visible(b) { b.map(|b| b.width * sc).unwrap_or(0.0) } else { 0.0 };
+            // Word makes room for horizontal borders: each row starts below the wider of
+            // the border above it, and the last row's bottom border follows the table.
+            let mut prev_bottom = 0.0f32;
             let mut k = range.start;
             while k < range.end {
                 let row = doc.paras[k].cell.unwrap().row;
@@ -1213,12 +1257,12 @@ pub fn layout(doc: &Document, fonts: &mut FontsView<'_>, zoom: f32) -> Layout {
                     let inner_r = (cx + cw - m[3] * sc).max(inner_l + 4.0);
                     let mut paras_in_cell = Vec::new();
                     let mut cy = m[0] * sc;
-                    let mut prev_after = 0.0;
+                    let mut prev_after = 0.0f32;
                     let mut first = true;
                     while k < range.end && doc.paras[k].cell == Some(cref) {
                         let p = &doc.paras[k];
                         if !first {
-                            cy += prev_after + p.space_before * sc;
+                            cy += prev_after.max(p.space_before * sc);
                         }
                         let pl = match &p.nested {
                             Some(sub) => {
@@ -1245,6 +1289,7 @@ pub fn layout(doc: &Document, fonts: &mut FontsView<'_>, zoom: f32) -> Layout {
                                         last_in_para: true,
                                         forced: false,
                                         leaders: Vec::new(),
+                                        leading: 0.0,
                                     }],
                                     marker: None,
                                     left: inner_l,
@@ -1265,40 +1310,30 @@ pub fn layout(doc: &Document, fonts: &mut FontsView<'_>, zoom: f32) -> Layout {
                     row_cells.push((cref, paras_in_cell, content_h));
                 }
                 let mut row_h = row_cells.iter().map(|c| c.2).fold(0.0f32, f32::max).max(4.0 * sc);
+                let row_edges: Vec<[Option<doc::Border>; 4]> = row_cells.iter().map(|c| edges_of(c.0)).collect();
+                let top_w = row_edges.iter().map(|e| border_w(&e[0])).fold(prev_bottom, f32::max);
+                prev_bottom = row_edges.iter().map(|e| border_w(&e[2])).fold(0.0, f32::max);
+                let mut border_top = top_w;
                 if row_props.height > 0.0 {
-                    row_h = if row_props.exact { row_props.height * sc } else { row_h.max(row_props.height * sc) };
+                    if row_props.exact {
+                        row_h = row_props.height * sc;
+                        border_top = 0.0;
+                    } else {
+                        row_h = row_h.max(row_props.height * sc - top_w);
+                    }
                 }
-                let (page, top) = pager.place(row_h);
-                for (cref, paras_in_cell, content_h) in row_cells {
+                let (page, top) = pager.place(row_h + border_top);
+                for ((cref, paras_in_cell, content_h), edges) in row_cells.into_iter().zip(row_edges) {
                     let cp = table.cell(cref.row, cref.col);
                     let span = cp.span.max(1);
                     let cx = col_x(cref.col);
                     let cw: f32 = widths.iter().skip(cref.col as usize).take(span as usize).sum();
-                    // Imported cells carry resolved edges; generated tables use the table's.
-                    let mut edges = if cp.edges.iter().any(|e| e.is_some()) {
-                        cp.edges
-                    } else {
-                        [
-                            if cref.row == 0 { tedges.top } else { tedges.inside_h },
-                            if cref.col + span >= ncols { tedges.right } else { tedges.inside_v },
-                            if cref.row == last_row { tedges.bottom } else { tedges.inside_h },
-                            if cref.col == 0 { tedges.left } else { tedges.inside_v },
-                        ]
-                    };
-                    if cp.vmerge == VMerge::Continue {
-                        edges[0] = None;
-                    }
-                    if cp.vmerge != VMerge::None
-                        && table.cells.get(&(cref.row + 1, cref.col)).is_some_and(|n| n.vmerge == VMerge::Continue)
-                    {
-                        edges[2] = None;
-                    }
                     cells.push(CellBox {
                         page,
                         x: cx,
                         y: top,
                         w: cw,
-                        h: row_h,
+                        h: row_h + border_top,
                         shade: cp.shade.or(cp.style_shade),
                         edges,
                     });
@@ -1307,6 +1342,7 @@ pub fn layout(doc: &Document, fonts: &mut FontsView<'_>, zoom: f32) -> Layout {
                         doc::VAlign::Center => ((row_h - content_h) / 2.0).max(0.0),
                         doc::VAlign::Bottom => (row_h - content_h).max(0.0),
                     };
+                    let dy = dy + border_top;
                     for (idx, pl, py) in paras_in_cell {
                         let first_line = lines.len();
                         let para_top = top + py + dy;
@@ -1324,6 +1360,7 @@ pub fn layout(doc: &Document, fonts: &mut FontsView<'_>, zoom: f32) -> Layout {
                     }
                 }
             }
+            pager.y += prev_bottom;
             prev_style = None;
             pi = range.end;
             continue;
@@ -1332,26 +1369,48 @@ pub fn layout(doc: &Document, fonts: &mut FontsView<'_>, zoom: f32) -> Layout {
         // ------------------------------------------------------ paragraph
         let same_style = prev_style.as_ref().is_some_and(|(s, _)| *s == para.style_id);
         let prev_contextual = prev_style.as_ref().is_some_and(|(_, c)| *c);
-        if !(same_style && prev_contextual) {
-            pager.y += pending_after;
-        }
-        if para.page_break_before && pager.y > 0.0 {
+        // Word separates paragraphs by the larger of the space after and the space
+        // before (not their sum), and keeps the space before at the start of the document.
+        let after = if same_style && prev_contextual { 0.0 } else { pending_after };
+        let absorbed = std::mem::take(&mut top_after);
+        if para.page_break_before && pager.y + after > 0.0 {
             pager.force = true;
         }
-        if pager.y > 0.0 && !pager.force && !(same_style && para.contextual) {
-            pager.y += para.space_before * sc;
-        }
+        let doc_start = pager.page == 0 && pager.y == 0.0 && lines.is_empty();
+        let before = if (pager.y + after > 0.0 || doc_start) && !pager.force && !(same_style && para.contextual) {
+            para.space_before * sc
+        } else if absorbed > 0.0 && !pager.force && !(same_style && para.contextual) {
+            (para.space_before * sc - absorbed).max(0.0)
+        } else {
+            0.0
+        };
+        pager.y += after.max(before);
         let (ncols, gap) = section_columns(sects.get(section_starts.len()));
         if ncols != pager.cols {
             pager.set_columns(ncols);
         }
-        let col_w = ((pw - ml - mr) - gap * sc * (ncols as f32 - 1.0)) / ncols as f32;
-        let pl = ctx.para(doc, pi, labels[pi].as_ref(), ml, ml + col_w);
+        let col_w = (((pw - ml - mr) - gap * sc * (ncols as f32 - 1.0)) / ncols as f32).max(0.0);
+        let mut pl = ctx.para(doc, pi, labels[pi].as_ref(), ml, ml + col_w);
+        // An empty paragraph that only ends a continuous section takes no room at the
+        // top of a page (Word).
+        let zero_top = para.chars.is_empty()
+            && para.sect_break
+            && !section_breaks_page(&sects, section_starts.len())
+            && (pager.force || pager.y == 0.0);
+        if zero_top {
+            for l in &mut pl.lines {
+                l.height = 0.0;
+                l.baseline = 0.0;
+                l.leading = 0.0;
+            }
+        }
         // Pagination rules: keep lines together, keep with next, orphan control.
         let heights: Vec<f32> = pl.lines.iter().map(|l| l.height).collect();
         let n_lines = heights.len();
         let total_h: f32 = heights.iter().sum();
-        if !pager.force && pager.y > pager.col_top {
+        // Keep rules apply anywhere but at the top of a page (also at the top of a
+        // set of columns started further down by a continuous section break).
+        if !pager.force && pager.y > 0.0 {
             let mut need = if para.keep_lines || (para.widow && n_lines <= 3) {
                 total_h
             } else if para.widow && n_lines >= 2 {
@@ -1377,9 +1436,18 @@ pub fn layout(doc: &Document, fonts: &mut FontsView<'_>, zoom: f32) -> Layout {
                     break;
                 }
             }
-            // Only break if the block would fit on an empty page.
-            if !pager.fits(need) && need <= pager.content_h - pager.col_top {
+            // Only break if the block would fit on an empty page; skip columns of this
+            // page that are too short for it, like Word.
+            if !pager.fits(need) && need <= pager.content_h {
                 pager.advance();
+                while !pager.force && !pager.fits(need) {
+                    if pager.col + 1 < pager.cols {
+                        pager.col += 1;
+                        pager.y = pager.col_top;
+                    } else {
+                        pager.force = true;
+                    }
+                }
             }
         }
         let first_line = lines.len();
@@ -1426,7 +1494,7 @@ pub fn layout(doc: &Document, fonts: &mut FontsView<'_>, zoom: f32) -> Layout {
                 }
             }
             let separator = if !new_notes.is_empty() { 14.0 * sc } else { 0.0 };
-            let (page, y) = pager.place_with(l.height, notes_h + if pager.notes_h == 0.0 { separator } else { 0.0 });
+            let (page, y) = pager.place_with(l.height, notes_h + if pager.notes_h == 0.0 { separator } else { 0.0 }, l.leading);
             for (key, nl, h) in new_notes {
                 page_notes.push((page, key, nl, h));
             }
@@ -1457,6 +1525,10 @@ pub fn layout(doc: &Document, fonts: &mut FontsView<'_>, zoom: f32) -> Layout {
         let marker = pl.marker.map(|(t, x)| (t, x + shift));
         boxes[pi] = Some(ParaBox { lines: first_line..lines.len(), left: pl.left + shift, right: pl.right + shift, marker });
         pending_after = para.space_after * sc;
+        if zero_top {
+            top_after = pending_after;
+            pending_after = 0.0;
+        }
         prev_style = Some((para.style_id.clone(), para.contextual));
         if para.sect_break && !section_breaks_page(&sects, section_starts.len()) && pager.cols > 1 {
             line_cols.resize(lines.len(), 0);
@@ -1482,7 +1554,7 @@ pub fn layout(doc: &Document, fonts: &mut FontsView<'_>, zoom: f32) -> Layout {
     if pager.cols > 1 && has_endnotes {
         line_cols.resize(lines.len(), 0);
         let (ncols, gap) = section_columns(sects.get(section_starts.len()));
-        let col_w = ((pw - ml - mr) - gap * sc * (ncols as f32 - 1.0)) / ncols as f32;
+        let col_w = (((pw - ml - mr) - gap * sc * (ncols as f32 - 1.0)) / ncols as f32).max(0.0);
         if let Some(b) = balance_columns(&mut lines, &mut line_cols, &mut boxes, section_first_line, ncols, col_w, gap * sc, pager.page) {
             pager.y = b - pager.mt;
             pager.max_y = pager.y;

@@ -2340,6 +2340,42 @@ fn note_blocks(note: &Document, used: HashSet<String>) -> (String, Vec<(String, 
     (blocks, w.rels, w.media)
 }
 
+/// Footnotes (false) and endnotes (true) referenced from the body, including references
+/// inside raw XML (text boxes, nested tables).
+fn referenced_notes(doc: &Document) -> HashSet<(bool, String)> {
+    fn scan_xml(xml: &str, out: &mut HashSet<(bool, String)>) {
+        for (tag, endnote) in [("<w:footnoteReference", false), ("<w:endnoteReference", true)] {
+            for (i, _) in xml.match_indices(tag) {
+                if let Some(id) = xml_attr(&xml[i..], "w:id") {
+                    out.insert((endnote, id.to_string()));
+                }
+            }
+        }
+    }
+    fn scan(doc: &Document, out: &mut HashSet<(bool, String)>) {
+        for p in &doc.paras {
+            for f in &p.fmts {
+                if let Some(o) = pool::obj(f.obj) {
+                    match &o.kind {
+                        ObjKind::NoteRef { endnote, id } if id != "self" => {
+                            out.insert((*endnote, id.clone()));
+                        }
+                        _ => scan_xml(&o.xml, out),
+                    }
+                }
+            }
+            match (&p.nested, &p.raw_block) {
+                (Some(sub), _) => scan(sub, out),
+                (None, Some(raw)) => scan_xml(raw, out),
+                _ => {}
+            }
+        }
+    }
+    let mut out = HashSet::new();
+    scan(doc, &mut out);
+    out
+}
+
 /// Rewritten (or new) footnotes/endnotes parts for every edited or created note.
 /// A missing part is created and related from the main document through `w`.
 /// Returns the parts and the content types of new parts.
@@ -2348,6 +2384,7 @@ fn note_parts(doc: &Document, w: &mut Writer) -> (Vec<(String, Vec<u8>)>, Vec<(S
     let mut overrides = Vec::new();
     let pkg = doc.pkg.as_deref();
     let main_rels = pkg.map(|p| read_rels(&p.parts, "word/document.xml")).unwrap_or_default();
+    let referenced = referenced_notes(doc);
     for (endnote, kind, tag) in [(false, "footnotes", "footnote"), (true, "endnotes", "endnote")] {
         let edited: Vec<(&String, &Document)> =
             doc.notes.iter().filter(|((e, _), d)| *e == endnote && d.edited).map(|((_, id), d)| (id, d)).collect();
@@ -2408,6 +2445,14 @@ fn note_parts(doc: &Document, w: &mut Writer) -> (Vec<(String, Vec<u8>)>, Vec<(S
                 root.children.push(xml::Node::El(e));
             }
         }
+        // Notes whose reference was deleted are dropped (Word may reject them);
+        // separator notes have a type and stay.
+        root.children.retain(|n| match n {
+            xml::Node::El(e) if e.name == tag && e.attr("type").is_none() => {
+                e.attr("id").is_some_and(|id| referenced.contains(&(endnote, id.to_string())))
+            }
+            _ => true,
+        });
         let xml = format!("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n{}", root.to_xml());
         out.push((target.clone(), xml.into_bytes()));
         if !rels.is_empty() {

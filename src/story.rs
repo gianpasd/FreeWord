@@ -1,4 +1,4 @@
-//! Editing headers, footers and notes in place ("stories" other than the body).
+﻿//! Editing headers, footers and notes in place ("stories" other than the body).
 //!
 //! While one is open, its sub-document is swapped into `App::doc` so every
 //! editing command works on it unchanged, and the body is kept here. The body
@@ -610,5 +610,83 @@ mod tests {
         let mut xml = String::new();
         std::io::Read::read_to_string(&mut zip.by_name("word/document.xml").unwrap(), &mut xml).unwrap();
         assert!(xml.contains("text") && !xml.contains("comment"), "{xml}");
+    }
+
+    /// Lays out `doc` and returns (page, top) of the first line of each paragraph.
+    fn para_tops(a: &mut App) -> Vec<(usize, f32)> {
+        a.rev += 1;
+        a.layout = None;
+        a.ensure_layout();
+        let lay = a.layout.as_ref().unwrap();
+        (0..a.doc.paras.len())
+            .map(|p| lay.lines.iter().find(|l| l.para == p).map(|l| (l.page, l.y)).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn word_paragraph_spacing_rules() {
+        let mut a = app();
+        let mut d = Document::new();
+        d.paras = ["Alpha", "Bravo", "Charlie"].iter().map(|t| crate::doc::Para::with_text(t, crate::doc::Style::Normal)).collect();
+        for (p, (before, after)) in d.paras.iter_mut().zip([(12.0, 12.0), (18.0, 6.0), (6.0, 0.0)]) {
+            p.space_before = before;
+            p.space_after = after;
+        }
+        a.doc = d;
+        let tops = para_tops(&mut a);
+        let lay = a.layout.as_ref().unwrap();
+        let (sc, top) = (lay.scale, lay.margins[0]);
+        let h = lay.lines[0].height;
+        // Space before applies at the start of the document.
+        assert!((tops[0].1 - (top + 12.0 * sc)).abs() < 0.01, "{tops:?}");
+        // Adjacent paragraphs are separated by the larger of after and before.
+        assert!((tops[1].1 - tops[0].1 - h - 18.0 * sc).abs() < 0.01, "{tops:?}");
+        assert!((tops[2].1 - tops[1].1 - h - 6.0 * sc).abs() < 0.01, "{tops:?}");
+    }
+
+    #[test]
+    fn nothing_follows_a_trailing_page_break() {
+        let mut a = app();
+        let mut d = Document::new();
+        let mut first = crate::doc::Para::with_text("Alpha", crate::doc::Style::Normal);
+        first.chars.push(crate::doc::PAGE_BREAK);
+        first.fmts.push(CharFmt::body());
+        let mut second = crate::doc::Para::with_text("Heading", crate::doc::Style::Normal);
+        second.space_before = 24.0;
+        d.paras = vec![first, second];
+        a.doc = d;
+        let tops = para_tops(&mut a);
+        let lay = a.layout.as_ref().unwrap();
+        // The heading starts the next page with no blank line or space before it.
+        assert_eq!(tops[1].0, 1);
+        assert!((tops[1].1 - lay.margins[0]).abs() < 0.01, "{tops:?}");
+        assert_eq!(lay.lines.iter().filter(|l| l.para == 0).count(), 1);
+    }
+
+    #[test]
+    fn notes_without_reference_are_dropped_on_save() {
+        let mut a = app();
+        a.insert_typed("Body");
+        a.insert_note(false);
+        a.insert_typed("KeptNote");
+        a.close_story();
+        a.insert_note(false);
+        a.insert_typed("OrphanNote");
+        a.close_story();
+        // Delete the orphan's reference.
+        let key = a.doc.notes.iter().find(|(_, d)| d.paras.iter().any(|p| p.text().contains("OrphanNote"))).map(|(k, _)| k.clone()).unwrap();
+        let o = a.doc.paras[0]
+            .fmts
+            .iter()
+            .position(|f| pool::obj(f.obj).is_some_and(|o| matches!(&o.kind, ObjKind::NoteRef { id, .. } if *id == key.1)))
+            .unwrap();
+        a.doc.delete(Pos::new(0, o), Pos::new(0, o + 1));
+        let bytes = crate::docx::docx_bytes(&a.doc).expect("save");
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let name = zip.file_names().flatten().find(|f| f.contains("footnotes")).expect("footnotes part").to_string();
+        let mut xml = String::new();
+        std::io::Read::read_to_string(&mut zip.by_name(&name).unwrap(), &mut xml).unwrap();
+        assert!(xml.contains("KeptNote") && !xml.contains("OrphanNote"), "{xml}");
+        assert!(xml.contains("separator"));
     }
 }

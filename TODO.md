@@ -5,9 +5,11 @@ Updated at the end of every work session. Newest session notes at the bottom.
 ## Next up
 
 - [ ] FreeWord's own pagination vs Word on `tests/corpus_ext` (sample-files.com, not in
-  git): only image-document matches. multi-column 15 vs 46 pages, basic-text 2 vs 1,
-  formatted-report 4 vs 3, large-document 51 vs 49; table-document, template and lists
-  have the right count but break pages elsewhere (`tests/pagination.ps1 -Files ...`)
+  git; `tests/pagination.ps1 -Files ...`): basic-text, formatted-report, image-document
+  match. large-document 50 vs 49 pages; lists, table-document, template break pages
+  elsewhere; multi-column has the right count but 2 page starts differ (column
+  balancing at a continuous break puts one more line in column 1; gap before the
+  following heading ~4pt too large)
 - [ ] Word compat rule: a Normal-style font size of 11/12 pt or left justification is
   overridden by the table style unless `overrideTableStyleFontSizeAndJustification`
   (LibreOffice `ApplyParagraphPropertiesFromTableStyle`); we apply table rPr only to
@@ -18,8 +20,8 @@ Updated at the end of every work session. Newest session notes at the bottom.
 - [ ] New comments: insert, reply, delete, resolve (write `comments.xml`)
 - [ ] Headers/footers: create one for a section other than the last, or a first-page /
   even-page variant (currently only the last section's default header can be created)
-- [ ] Notes: deleting a reference leaves its note in `footnotes.xml` (harmless, but
-  should be removed); note numbering formats (`w:numFmt`) and restart rules
+- [ ] Notes: numbering formats (`w:numFmt`) and restart rules; notes whose reference was
+  deleted stay in an *unedited* notes part (only rewritten parts are pruned)
 - [ ] `.fwd` files: hyperlinks/pictures added to edited notes or new headers lose their
   relationships when reopened (the .docx path is fine)
 - [ ] Notes and nested-table UI: clicking into a footnote/endnote/nested table and the
@@ -78,6 +80,15 @@ Updated at the end of every work session. Newest session notes at the bottom.
   PAGE/NUMPAGES fields); new headers for documents without one
 - [x] Edit nested tables in place (click into one; Esc or click outside to leave);
   rewritten on save with their own relationships/media; kept in `.fwd` files
+- [x] Pagination like Word (multi-column 15 -> 46 pages, as Word): paragraph gaps are
+  max(space after, space before), space before kept at the document start; font metrics
+  no longer pixel-rounded; multiple line spacing's extra may hang into the bottom
+  margin; keep-together blocks skip columns too short for them; zero/negative column
+  widths give one character per line; no blank line after a trailing page break;
+  empty continuous section-break paragraphs take no room at a page top; table rows
+  make room for horizontal borders
+- [x] Notes without a reference are dropped when a notes part is rewritten (Word
+  rejected a stress result with an orphan footnote holding a picture)
 - [x] Table-style paragraph properties rank below the paragraph style (as in Word and
   LibreOffice); cell paragraphs no longer get the table style's spacing written as
   direct formatting (large-document lost 5 pages in Word after a round-trip)
@@ -129,3 +140,9 @@ Updated at the end of every work session. Newest session notes at the bottom.
   Tests: `cargo test` 9/9; round-trip corpus 10/10 and corpus_ext 8/8 OK (+1 SKIP:
   tracked-changes original is rejected by Word, our output opens); visual compare
   identical on both. FreeWord pagination matches Word on 1 of 8 corpus_ext files.
+- **2026-10-11** – Pagination fixes found with Word probes (scripts in the session
+  scratchpad: spacing, page-break and section-break placement): see Done. Pagination
+  vs Word: corpus 8/10 same starts (04/07 differ only in extracted text, as before),
+  corpus_ext 3/8 exact and multi-column 46/46 pages. Orphan notes pruned on save.
+  Tests: `cargo test` 12/12; round-trip corpus 10/10, corpus_ext 8/8 (+1 SKIP); visual
+  compare 10/10 identical; stress 3x200 corpus + 2x200 corpus_ext, all open in Word.
