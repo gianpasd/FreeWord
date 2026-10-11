@@ -335,6 +335,8 @@ impl App {
         });
         let zone = if let Some(n) = note {
             Zone::Note(n.key.clone())
+        } else if let Some(para) = bl.nested_at(page, local.x, local.y) {
+            Zone::Nested(para)
         } else if local.y < bl.margins[0] {
             Zone::Header
         } else if local.y > bl.page_h - bl.margins[2] {
@@ -402,7 +404,7 @@ impl App {
                 let count = if same_spot { self.last_click.2 + 1 } else { 1 };
                 self.last_click = (time, p, count);
                 // Headers and footers open and close with a double-click, like Word;
-                // notes with a single click.
+                // notes and nested tables with a single click.
                 let (zpage, zone, local) = self.zone_at(rect, lay, p);
                 let at = Some((local.x, local.y));
                 let at_page = Some((zpage, local.x, local.y));
@@ -411,17 +413,19 @@ impl App {
                 let req = match own {
                     None => match &zone {
                         Zone::Note(key) => Some(StoryReq::OpenNote { key: key.clone(), at: at_page }),
+                        Zone::Nested(para) => Some(StoryReq::OpenNested { para: *para, at: at_page }),
                         Zone::Header | Zone::Footer if count == 2 => Some(hf_req(&zone)),
                         _ => None,
                     },
                     // Inside the open story: ordinary editing.
-                    Some((z0, p0)) if zone == z0 && (zpage == p0 || matches!(z0, Zone::Note(_))) => None,
+                    Some((z0, p0)) if zone == z0 && (zpage == p0 || matches!(z0, Zone::Note(_) | Zone::Nested(_))) => None,
                     Some((z0, _)) => {
-                        let note_open = matches!(z0, Zone::Note(_));
+                        let note_open = matches!(z0, Zone::Note(_) | Zone::Nested(_));
                         Some(match &zone {
                             Zone::Note(key) => StoryReq::OpenNote { key: key.clone(), at: at_page },
+                            Zone::Nested(para) if note_open => StoryReq::OpenNested { para: *para, at: at_page },
                             Zone::Body if note_open => StoryReq::Close { at: at_page },
-                            Zone::Body if count == 2 => StoryReq::Close { at: None },
+                            Zone::Body | Zone::Nested(_) if count == 2 => StoryReq::Close { at: None },
                             // Another header/footer (or the same one on another page).
                             Zone::Header | Zone::Footer if count == 2 || zone == z0 => hf_req(&zone),
                             _ => return,
@@ -692,7 +696,7 @@ impl App {
                     Target::Hf { section, variant } if play.hf_slot(pdoc, *variant < 2, page) == (*section, *variant) => {
                         Some(if *variant < 2 { (0.0, play.margins[0]) } else { (lay.page_h - play.margins[2], lay.page_h) })
                     }
-                    Target::Note(_) if page == st.page && !lay.lines.is_empty() => {
+                    Target::Note(_) | Target::Nested(_) if page == st.page && !lay.lines.is_empty() => {
                         let t = lay.lines.iter().map(|l| l.y).fold(f32::MAX, f32::min);
                         let b = lay.lines.iter().map(|l| l.y + l.height).fold(0.0f32, f32::max);
                         Some((t - 4.0, b + 4.0))

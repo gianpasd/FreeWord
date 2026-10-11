@@ -4,7 +4,6 @@ Updated at the end of every work session. Newest session notes at the bottom.
 
 ## Next up
 
-- [ ] Editing inside nested tables
 - [ ] Text-box contents rendered (wps:txbx) instead of a placeholder box
 - [ ] Repeat table header rows (`w:tblHeader`) on each new page; split long rows across pages (`cantSplit`)
 - [ ] Per-change Accept / Reject (next/previous change navigation)
@@ -15,8 +14,11 @@ Updated at the end of every work session. Newest session notes at the bottom.
   should be removed); note numbering formats (`w:numFmt`) and restart rules
 - [ ] `.fwd` files: hyperlinks/pictures added to edited notes or new headers lose their
   relationships when reopened (the .docx path is fine)
-- [ ] Notes UI: clicking into a footnote/endnote and the note band highlight were only
-  covered by unit tests, not tried interactively yet
+- [ ] Notes and nested-table UI: clicking into a footnote/endnote/nested table and the
+  highlight band were only covered by unit tests, not tried interactively yet
+- [ ] Nested tables: tables nested two levels deep, and nested tables inside headers,
+  notes or text boxes, are still display-only; a nested table split across pages
+  is drawn on one page
 - [ ] Pasting objects with relationships (charts, SmartArt) between body, headers and
   notes drops them; copy their target parts instead
 
@@ -66,6 +68,9 @@ Updated at the end of every work session. Newest session notes at the bottom.
 
 - [x] Edit headers/footers in place (double-click, Esc to leave; Insert > Header/Footer;
   PAGE/NUMPAGES fields); new headers for documents without one
+- [x] Edit nested tables in place (click into one; Esc or click outside to leave);
+  rewritten on save with their own relationships/media; kept in `.fwd` files
+- [x] `.fwd` save failed for any table with cell properties (tuple map keys in JSON)
 - [x] Edit footnotes/endnotes in place (click a note); Insert Footnote/Endnote
   (Ctrl+Alt+F / Ctrl+Alt+D); notes parts rewritten or created on save
 
@@ -99,3 +104,10 @@ Updated at the end of every work session. Newest session notes at the bottom.
   (reports HANG). Tests: `cargo test` 7/7; corpus round-trip and visual compare
   unchanged (10/10 identical); 80 stress runs × 400 edits (now incl. header and
   note edits) + 24 header/note outputs all open in Word.
+- **2026-10-11** – Nested tables editable in place as a story (single click opens,
+  Esc/click outside closes, one undo step); edited nested tables re-serialized on
+  save through the main writer (shared rel ids, separate media names) and stored
+  in `.fwd`, which now also rebuilds nested tables on load. Fixed `.fwd` save of
+  tables with cell properties. Tests: `cargo test` 8/8; round-trip 10/10 OK;
+  visual compare 10/10 identical; all `tests/out/hf` outputs (incl. nested edit)
+  open in Word; short stress run (3 × 200).

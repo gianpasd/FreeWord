@@ -324,7 +324,10 @@ pub fn save_native(doc: &Document, path: &Path) -> Result<(), String> {
                 sect_break: p.sect_break,
                 ppr_extra: p.ppr_extra.clone(),
                 cell: p.cell,
-                raw_block: p.raw_block.clone(),
+                raw_block: match p.nested.as_deref().filter(|d| d.edited) {
+                    Some(sub) => Some(crate::docx::nested_table_xml(sub)),
+                    None => p.raw_block.clone(),
+                },
                 end: (&p.end_fmt).into(),
                 runs: runs(p).iter().map(|(t, f)| FileRun { text: t.clone(), fmt: f.into() }).collect(),
             })
@@ -460,6 +463,13 @@ pub fn load_native(path: &Path) -> Result<Document, String> {
             hf.resize_with(sections, Default::default);
         }
         doc.put_hf(sections - 1, if *header { 0 } else { 2 }, sub);
+    }
+    // Nested tables are displayed (and edited) from their XML.
+    for i in 0..doc.paras.len() {
+        let p = &doc.paras[i];
+        if let Some(raw) = p.raw_block.as_ref().filter(|r| p.cell.is_some() && r.starts_with("<w:tbl")) {
+            doc.paras[i].nested = crate::docx::nested_from_xml(&doc, raw).map(Arc::new);
+        }
     }
     doc.ensure_trailing_para();
     Ok(doc)

@@ -18,6 +18,8 @@ pub enum Target {
     Hf { section: usize, variant: usize },
     /// Footnote (false) or endnote (true) by id.
     Note((bool, String)),
+    /// Nested table held by a body paragraph.
+    Nested(usize),
 }
 
 /// Area of a page under the pointer.
@@ -26,6 +28,8 @@ pub enum Zone {
     Header,
     Footer,
     Note((bool, String)),
+    /// Nested table held by a body paragraph.
+    Nested(usize),
     Body,
 }
 
@@ -50,6 +54,7 @@ impl Story {
             Target::Hf { variant, .. } if *variant < 2 => Zone::Header,
             Target::Hf { .. } => Zone::Footer,
             Target::Note(k) => Zone::Note(k.clone()),
+            Target::Nested(p) => Zone::Nested(*p),
         }
     }
 
@@ -69,6 +74,7 @@ impl Story {
                 if self.body.hf.len() > 1 { format!("{base} -Section {}-", section + 1) } else { base.to_string() }
             }
             Target::Note((endnote, _)) => (if *endnote { "Endnote" } else { "Footnote" }).to_string(),
+            Target::Nested(_) => "Nested Table".to_string(),
         }
     }
 }
@@ -79,6 +85,8 @@ pub enum StoryReq {
     Open { page: usize, header: bool, at: Option<(f32, f32)> },
     /// Open a note, with the caret near `at` = (page, x, y).
     OpenNote { key: (bool, String), at: Option<(usize, f32, f32)> },
+    /// Open the nested table of body paragraph `para`, with the caret near `at` = (page, x, y).
+    OpenNested { para: usize, at: Option<(usize, f32, f32)> },
     /// Return to the body, with the caret near `at` if given.
     Close { at: Option<(usize, f32, f32)> },
 }
@@ -110,6 +118,7 @@ impl App {
         match req {
             StoryReq::Open { page, header, at } => self.open_hf(page, header, at),
             StoryReq::OpenNote { key, at } => self.open_note(key, at),
+            StoryReq::OpenNested { para, at } => self.open_nested(para, at),
             StoryReq::Close { at } => {
                 self.close_story();
                 if let Some((page, x, y)) = at {
@@ -188,6 +197,22 @@ impl App {
         }
     }
 
+    /// Starts editing the nested table held by body paragraph `para`, with the caret near `at` = (page, x, y).
+    pub fn open_nested(&mut self, para: usize, at: Option<(usize, f32, f32)>) {
+        if self.story.as_deref().is_none_or(|s| s.target != Target::Nested(para)) {
+            self.close_story();
+            let Some(sub) = self.doc.paras.get(para).and_then(|p| p.nested.as_deref()).cloned() else { return };
+            self.ensure_layout();
+            let page = self.layout.as_ref().and_then(|l| l.nested.iter().find(|n| n.0 == para)).map(|n| n.1).unwrap_or(0);
+            let before = self.snap();
+            self.begin_story(Target::Nested(para), page, sub, before, false);
+        }
+        match at {
+            Some((page, x, y)) => self.place_caret(page, Some((x, y))),
+            None => self.set_cursor(Pos::default(), false),
+        }
+    }
+
     fn snap(&self) -> Snap {
         Snap { doc: self.doc.clone(), cursor: self.cursor, anchor: self.anchor }
     }
@@ -242,6 +267,11 @@ impl App {
             Target::Note(key) => {
                 Arc::make_mut(&mut st.body.notes).insert(key.clone(), sub);
             }
+            Target::Nested(p) => {
+                if let Some(para) = st.body.paras.get_mut(*p) {
+                    para.nested = Some(Arc::new(sub));
+                }
+            }
         }
     }
 
@@ -257,6 +287,11 @@ impl App {
             Target::Hf { section, variant } => bl.story_layout(*section, *variant, st.page)?,
             Target::Note(key) => {
                 let (l, page) = bl.note_story_layout(key)?;
+                st.page = page;
+                l
+            }
+            Target::Nested(p) => {
+                let (l, page) = bl.nested_story_layout(*p)?;
                 st.page = page;
                 l
             }
@@ -510,5 +545,52 @@ mod tests {
             }
         }
         assert!(edited >= 16, "only {edited} headers/footers edited");
+    }
+
+    fn nested_texts(doc: &Document) -> String {
+        doc.paras.iter().filter_map(|p| p.nested.as_deref()).flat_map(|d| d.paras.iter().map(|p| p.text())).collect::<Vec<_>>().join("
+")
+    }
+
+    #[test]
+    fn edit_nested_tables_in_corpus() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/corpus");
+        let mut edited = 0;
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_none_or(|e| e != "docx") {
+                continue;
+            }
+            let mut a = app();
+            a.open_path(&path);
+            let Some(para) = a.doc.paras.iter().position(|p| p.nested.is_some()) else { continue };
+            // The nested table is found under the pointer.
+            a.ensure_layout();
+            let lay = a.layout.as_ref().unwrap();
+            let &(_, page, x, y, _) = lay.nested.iter().find(|n| n.0 == para).expect("nested table laid out");
+            assert_eq!(lay.nested_at(page, x + 2.0, y + 2.0), Some(para), "{}", path.display());
+            a.open_nested(para, Some((page, x + 2.0, y + 2.0)));
+            assert!(a.story.is_some(), "{}: story did not open", path.display());
+            assert!(a.doc.paras[a.cursor.p].cell.is_some(), "caret not in a cell");
+            a.insert_typed("ZzNestedEdit");
+            a.close_story();
+            assert!(nested_texts(&a.doc).contains("ZzNestedEdit"), "edit not stored in the body");
+            let orig_paras = a.doc.paras.len();
+            let stem = path.file_stem().unwrap().to_string_lossy().to_string();
+            let back = save_reload(&a, &format!("{stem}.nested"));
+            assert!(nested_texts(&back).contains("ZzNestedEdit"), "{}: edit lost after save", path.display());
+            assert_eq!(back.paras.len(), orig_paras, "{}", path.display());
+            // .fwd files keep the edit too.
+            let fwd = std::env::temp_dir().join(format!("fw_nested_{stem}.fwd"));
+            crate::io::save_native(&a.doc, &fwd).expect("save fwd");
+            let back = crate::io::load_native(&fwd).expect("load fwd");
+            let _ = std::fs::remove_file(&fwd);
+            assert!(nested_texts(&back).contains("ZzNestedEdit"), "{}: edit lost in .fwd", path.display());
+            // One undo restores the nested table.
+            a.undo();
+            assert!(!nested_texts(&a.doc).contains("ZzNestedEdit"));
+            edited += 1;
+        }
+        assert!(edited >= 1, "no corpus document has a nested table");
     }
 }

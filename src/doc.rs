@@ -456,7 +456,7 @@ pub struct Table {
     /// Left indent of the table in points.
     pub indent: f32,
     pub align: Option<Align>,
-    #[serde(default)]
+    #[serde(default, with = "cell_map")]
     pub cells: BTreeMap<(u32, u32), CellProps>,
     #[serde(default)]
     pub rows: BTreeMap<u32, RowProps>,
@@ -472,6 +472,32 @@ pub struct Table {
     /// Default cell margins (top, left, bottom, right) in points.
     #[serde(default = "default_cell_margins")]
     pub cell_margins: [f32; 4],
+}
+
+/// Cell properties keyed by (row, col), stored as a list (JSON keys must be strings).
+mod cell_map {
+    use super::CellProps;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::collections::BTreeMap;
+
+    pub fn serialize<S: Serializer>(m: &BTreeMap<(u32, u32), CellProps>, s: S) -> Result<S::Ok, S::Error> {
+        m.iter().map(|(&(r, c), p)| (r, c, p)).collect::<Vec<_>>().serialize(s)
+    }
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Repr {
+        List(Vec<(u32, u32, CellProps)>),
+        // Older files could only hold an empty map.
+        Map(BTreeMap<String, CellProps>),
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<BTreeMap<(u32, u32), CellProps>, D::Error> {
+        Ok(match Repr::deserialize(d)? {
+            Repr::List(v) => v.into_iter().map(|(r, c, p)| ((r, c), p)).collect(),
+            Repr::Map(_) => BTreeMap::new(),
+        })
+    }
 }
 
 fn default_cell_margins() -> [f32; 4] {

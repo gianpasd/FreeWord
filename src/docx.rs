@@ -670,6 +670,8 @@ impl Reader<'_> {
         d.tables = std::mem::take(&mut r.tables);
         d.numbering = self.numbering.clone();
         d.styles = Arc::new(self.sheet.clone());
+        // Its raw XML refers to the main document's relationships.
+        d.part_pkg = self.pkg;
         d.ensure_trailing_para();
         // No trailing empty paragraph inside a cell.
         if d.paras.last().is_some_and(|p| p.cell.is_none() && p.chars.is_empty()) && d.paras.len() > 1 {
@@ -1480,6 +1482,8 @@ struct Writer<'a> {
     used_rel_ids: HashSet<String>,
     /// Write floating pictures inline (notes).
     inline_only: bool,
+    /// File name prefix of new media parts.
+    media_tag: String,
 }
 
 impl<'a> Writer<'a> {
@@ -1497,6 +1501,7 @@ impl<'a> Writer<'a> {
             drop_markers: HashSet::new(),
             used_rel_ids,
             inline_only: false,
+            media_tag: "fw_image".into(),
         };
         w.balance_fields();
         w
@@ -1550,7 +1555,7 @@ impl<'a> Writer<'a> {
         }
         let img = &self.doc.images[&image];
         let (ext, _) = image_kind(&img.bytes);
-        let name = format!("media/fw_image{image}.{ext}");
+        let name = format!("media/{}{image}.{ext}", self.media_tag);
         self.media.push((format!("word/{name}"), img.bytes.clone()));
         let id = self.new_rel("image", &name, false);
         self.image_rels.insert(image, id.clone());
@@ -1660,12 +1665,16 @@ impl<'a> Writer<'a> {
     }
 
     fn para_xml(&mut self, pi: usize, out: &mut String) {
-        let p = &self.doc.paras[pi];
+        let doc = self.doc;
+        let p = &doc.paras[pi];
+        if let Some(sub) = p.nested.as_deref().filter(|d| d.edited) {
+            self.nested_xml(pi, sub, out);
+            return;
+        }
         if let Some(raw) = &p.raw_block {
             out.push_str(raw);
             return;
         }
-        let doc = self.doc;
         let style = self.style_for_write(p);
         let base = doc.styles.para_props(style.as_deref(), &doc.numbering);
         let mut items: Vec<(String, String)> = Vec::new();
@@ -1905,6 +1914,18 @@ impl<'a> Writer<'a> {
 </wp:inline></w:drawing></w:r>",
             id = 60000 + n
         ));
+    }
+
+    /// A nested table edited in FreeWord, written with this writer's relationships.
+    fn nested_xml(&mut self, pi: usize, sub: &Document, out: &mut String) {
+        let mut w = Writer::new(sub, self.pkg_id, std::mem::take(&mut self.used_rel_ids));
+        w.media_tag = format!("fw_nested{pi}_image");
+        w.doc_pr_id = self.doc_pr_id;
+        out.push_str(&w.blocks_xml());
+        self.used_rel_ids = w.used_rel_ids;
+        self.doc_pr_id = w.doc_pr_id;
+        self.rels.extend(w.rels);
+        self.media.extend(w.media);
     }
 
     fn table_xml(&mut self, table: u32, range: std::ops::Range<usize>, out: &mut String) {
@@ -2402,6 +2423,24 @@ pub fn note_from_xml(doc: &Document, endnote: bool, id: &str, xml: &str) -> Docu
     d.source = None;
     d.edited = true;
     d
+}
+
+/// A nested table read back from its `w:tbl` XML (for `.fwd` files).
+pub fn nested_from_xml(doc: &Document, xml: &str) -> Option<Document> {
+    let target = "word/nested_fw.xml".to_string();
+    let wrapped = format!("<w:hdr xmlns:w=\"{W_NS}\" xmlns:r=\"{R_NS}\">{xml}</w:hdr>");
+    let parts = BTreeMap::from([(target.clone(), wrapped.into_bytes())]);
+    let mut d = hf_document(&parts, &target, doc.pkg_id(), &doc.styles, &doc.numbering, 300_000_000)?;
+    d.source = None;
+    if d.paras.last().is_some_and(|p| p.cell.is_none() && p.chars.is_empty()) && d.paras.len() > 1 {
+        d.paras.pop();
+    }
+    Some(d)
+}
+
+/// XML of a nested table edited in FreeWord (without new relationships, for `.fwd` files).
+pub fn nested_table_xml(sub: &Document) -> String {
+    Writer::new(sub, sub.pkg_id(), HashSet::new()).blocks_xml()
 }
 
 /// XML of every edited note: (endnote, id, `w:footnote`/`w:endnote` element).

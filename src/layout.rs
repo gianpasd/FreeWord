@@ -212,13 +212,28 @@ impl Layout {
     /// Layout of a header/footer placed on `page` of this (body) layout, for editing it in place.
     pub fn story_layout(&self, section: usize, variant: usize, page: usize) -> Option<Layout> {
         let b = self.hf.iter().find(|b| b.section == section && b.variant == variant)?;
-        Some(self.placed(&b.lay, page, b.dy))
+        Some(self.placed(&b.lay, page, 0.0, b.dy))
     }
 
     /// Layout of a footnote/endnote where it is shown, with its page.
     pub fn note_story_layout(&self, key: &(bool, String)) -> Option<(Layout, usize)> {
         let n = self.notes.iter().find(|n| &n.key == key)?;
-        Some((self.placed(&n.lay, n.page, n.y), n.page))
+        Some((self.placed(&n.lay, n.page, 0.0, n.y), n.page))
+    }
+
+    /// Layout of the nested table held by body paragraph `para` where it is shown, with its page.
+    pub fn nested_story_layout(&self, para: usize) -> Option<(Layout, usize)> {
+        let (_, page, x, y, nl) = self.nested.iter().find(|n| n.0 == para)?;
+        Some((self.placed(nl, *page, *x, *y), *page))
+    }
+
+    /// Body paragraph of the nested table under page-relative (`x`, `y`).
+    pub fn nested_at(&self, page: usize, x: f32, y: f32) -> Option<usize> {
+        self.nested.iter().find_map(|(para, pg, nx, ny, nl)| {
+            let w = nl.cells.iter().map(|c| c.x + c.w).fold(0.0f32, f32::max);
+            let h = content_height(nl);
+            (*pg == page && x >= *nx && x <= nx + w && y >= *ny && y <= ny + h).then_some(*para)
+        })
     }
 
     /// Vertical extent of a footnote/endnote on its page.
@@ -226,23 +241,35 @@ impl Layout {
         (n.y, n.y + content_height(&n.lay))
     }
 
-    /// A sub-layout (header, note) moved onto `page` at offset `dy`; every other page is empty.
-    fn placed(&self, sub: &Layout, page: usize, dy: f32) -> Layout {
+    /// A sub-layout (header, note, nested table) moved onto `page` at offset (`dx`, `dy`);
+    /// every other page is empty.
+    fn placed(&self, sub: &Layout, page: usize, dx: f32, dy: f32) -> Layout {
         let mut l = sub.clone();
         for line in &mut l.lines {
             line.page = page;
             line.y += dy;
+            line.xs.iter_mut().for_each(|x| *x += dx);
+        }
+        for p in &mut l.paras {
+            p.left += dx;
+            p.right += dx;
+            if let Some((_, mx)) = &mut p.marker {
+                *mx += dx;
+            }
         }
         for c in &mut l.cells {
             c.page = page;
+            c.x += dx;
             c.y += dy;
         }
         for f in &mut l.floats {
             f.page = page;
+            f.x += dx;
             f.y += dy;
         }
         for n in &mut l.nested {
             n.1 = page;
+            n.2 += dx;
             n.3 += dy;
         }
         l.pages = self.pages;

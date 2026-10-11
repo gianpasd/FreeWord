@@ -438,7 +438,11 @@ impl App {
     fn story_group(&mut self, ui: &mut Ui) {
         let Some(st) = self.story.as_deref() else { return };
         let (header, page, name, is_hf) = (st.zone() == crate::story::Zone::Header, st.page, st.name(), st.is_hf());
-        let title = if is_hf { "Header & Footer" } else { "Notes" };
+        let title = match st.target {
+            crate::story::Target::Hf { .. } => "Header & Footer",
+            crate::story::Target::Note(_) => "Notes",
+            crate::story::Target::Nested(_) => "Table",
+        };
         group(ui, title, |ui| {
             ui.vertical(|ui| {
                 ui.label(RichText::new(name).strong().color(ACCENT_FOR(ui)));
