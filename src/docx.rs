@@ -295,6 +295,11 @@ impl Reader<'_> {
                     f.font = fonts::font_id(if fonts::is_available("Cambria") { "Cambria" } else { fonts::default_font() });
                     self.push_obj(p, &f, c.to_xml(), ObjKind::Label(text));
                 }
+                "del" | "moveFrom" => {
+                    let mut f = *base;
+                    f.link = link;
+                    self.push_obj(p, &f, c.to_xml(), ObjKind::Deleted(c.run_text()));
+                }
                 _ => {
                     let mut f = *base;
                     f.link = link;
@@ -943,6 +948,33 @@ fn hf_document(
     Some(d)
 }
 
+/// Comments (`comments.xml`) by id.
+pub fn comments_from_parts(parts: &BTreeMap<String, Vec<u8>>) -> BTreeMap<String, crate::doc::Comment> {
+    let mut out = BTreeMap::new();
+    let main = read_rels(parts, "")
+        .values()
+        .find(|r| r.kind == "officeDocument")
+        .map(|r| r.target.clone())
+        .unwrap_or_else(|| "word/document.xml".into());
+    let rels = read_rels(parts, &main);
+    let Some(target) = rels.values().find(|r| r.kind == "comments").map(|r| r.target.clone()) else { return out };
+    let Some(root) = part_xml(parts, &target) else { return out };
+    for c in root.elems().filter(|e| e.name == "comment") {
+        let Some(id) = c.attr("id") else { continue };
+        let text: Vec<String> = c.elems().filter(|e| e.name == "p").map(|p| p.run_text()).collect();
+        out.insert(
+            id.to_string(),
+            crate::doc::Comment {
+                author: c.attr("author").unwrap_or("").to_string(),
+                initials: c.attr("initials").unwrap_or("").to_string(),
+                date: c.attr("date").unwrap_or("").to_string(),
+                text: text.join("\n").trim().to_string(),
+            },
+        );
+    }
+    out
+}
+
 /// Footnote and endnote texts (`footnotes.xml`, `endnotes.xml`) by (is endnote, id).
 pub fn notes_from_parts(
     parts: &BTreeMap<String, Vec<u8>>,
@@ -1197,6 +1229,7 @@ pub fn load_docx_bytes(bytes: &[u8]) -> Result<Document, String> {
     }
     doc.hf = Arc::new(hf_sections(&pkg.parts, &sects, pkg_id, &doc.styles, &doc.numbering));
     doc.notes = Arc::new(notes_from_parts(&pkg.parts, pkg_id, &doc.styles, &doc.numbering));
+    doc.comments = Arc::new(comments_from_parts(&pkg.parts));
     doc.pkg = Some(Arc::new(pkg));
     if !paras.is_empty() {
         doc.paras = paras;
@@ -1506,6 +1539,7 @@ impl Writer<'_> {
             ObjKind::FieldBegin | ObjKind::FieldSep | ObjKind::FieldEnd | ObjKind::Wrap { .. } => true,
             ObjKind::Label(_) => !pool::has_rel_refs(&o.xml),
             ObjKind::Hidden => o.xml.contains("instrText") && !pool::has_rel_refs(&o.xml),
+            ObjKind::Deleted(_) => !pool::has_rel_refs(&o.xml),
             _ => false,
         }
     }

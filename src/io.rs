@@ -357,6 +357,7 @@ pub fn load_native(path: &Path) -> Result<Document, String> {
     }
     if let Some(pkg) = doc.pkg.clone() {
         doc.notes = Arc::new(crate::docx::notes_from_parts(&pkg.parts, pkg.id, &doc.styles, &doc.numbering));
+        doc.comments = Arc::new(crate::docx::comments_from_parts(&pkg.parts));
     }
     for im in fd.images {
         if let Ok(bytes) = b64.decode(im.data.as_bytes()) {

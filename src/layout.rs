@@ -14,6 +14,14 @@ use std::collections::HashMap;
 use std::ops::Range;
 
 pub const PT_TO_PX: f32 = 96.0 / 72.0;
+
+/// Whether tracked changes are shown with markup (insertions coloured,
+/// deletions struck through) rather than as the final text.
+pub static SHOW_MARKUP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn show_markup() -> bool {
+    SHOW_MARKUP.load(std::sync::atomic::Ordering::Relaxed)
+}
 const SCRIPT_SCALE: f32 = 0.65;
 const SMALL_CAPS_SCALE: f32 = 0.8;
 
@@ -91,6 +99,65 @@ pub struct Layout {
     pub floats: Vec<FloatBox>,
     /// Nested tables: (paragraph, page, x, y, layout).
     pub nested: Vec<(usize, usize, f32, f32, Box<Layout>)>,
+    /// Tracked insertions: (paragraph, start, end).
+    pub ins_ranges: Vec<(usize, usize, usize)>,
+    /// Lines that contain tracked changes (for change bars).
+    pub rev_lines: std::collections::HashSet<usize>,
+    /// Commented ranges: (comment id, start, end).
+    pub comment_ranges: Vec<(String, Pos, Pos)>,
+}
+
+/// Value of a `w:id="..."` attribute in raw XML.
+fn xml_id(xml: &str) -> Option<String> {
+    let i = xml.find(" w:id=\"")? + 7;
+    let e = xml[i..].find('"')?;
+    Some(xml[i..i + e].to_string())
+}
+
+/// Tracked insertions and lines with revisions.
+fn find_revisions(doc: &Document) -> Vec<(usize, usize, usize)> {
+    let mut out = Vec::new();
+    for (pi, p) in doc.paras.iter().enumerate() {
+        let mut open: Vec<usize> = Vec::new();
+        for (ci, f) in p.fmts.iter().enumerate() {
+            let Some(o) = pool::obj(f.obj) else { continue };
+            if let ObjKind::Wrap { open: is_open } = o.kind {
+                if is_open {
+                    if o.xml.starts_with("<w:ins") || o.xml.starts_with("<w:moveTo") {
+                        open.push(ci + 1);
+                    } else {
+                        open.push(usize::MAX);
+                    }
+                } else if let Some(s) = open.pop() {
+                    if s != usize::MAX && ci > s {
+                        out.push((pi, s, ci));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Commented ranges from commentRangeStart/End (or the reference alone).
+fn find_comments(doc: &Document) -> Vec<(String, Pos, Pos)> {
+    let mut starts: HashMap<String, Pos> = HashMap::new();
+    let mut out: Vec<(String, Pos, Pos)> = Vec::new();
+    for (pi, p) in doc.paras.iter().enumerate() {
+        for (ci, f) in p.fmts.iter().enumerate() {
+            let Some(o) = pool::obj(f.obj) else { continue };
+            let Some(id) = xml_id(&o.xml) else { continue };
+            if o.xml.contains("commentRangeStart") {
+                starts.insert(id, Pos::new(pi, ci));
+            } else if o.xml.contains("commentRangeEnd") {
+                let s = starts.remove(&id).unwrap_or(Pos::new(pi, ci));
+                out.push((id, s, Pos::new(pi, ci)));
+            } else if o.xml.contains("commentReference") && !out.iter().any(|(i, _, _)| *i == id) {
+                out.push((id, Pos::new(pi, ci), Pos::new(pi, ci)));
+            }
+        }
+    }
+    out
 }
 
 type BTreeMapPages = std::collections::BTreeMap<usize, Vec<((bool, String), Box<Layout>, f32)>>;
@@ -358,6 +425,12 @@ impl Ctx<'_, '_> {
                             asc[i] = a;
                             desc[i] = d;
                             self.obj_text.insert((pi, i), label);
+                        }
+                        ObjKind::Deleted(s) if show_markup() => {
+                            widths[i] = self.text_width(&f, s);
+                            let (a, d) = self.extent(&f);
+                            asc[i] = a;
+                            desc[i] = d;
                         }
                         ObjKind::Label(s) => {
                             widths[i] = self.text_width(&f, s);
@@ -1365,6 +1438,17 @@ pub fn layout(doc: &Document, fonts: &mut FontsView<'_>, zoom: f32) -> Layout {
         }
     }
 
+    // Lines with tracked changes get a change bar.
+    let ins_ranges = find_revisions(doc);
+    let mut rev_lines = std::collections::HashSet::new();
+    for (li, l) in lines.iter().enumerate() {
+        let p = &doc.paras[l.para];
+        let ins = ins_ranges.iter().any(|(pp, s, e)| *pp == l.para && *s < l.end.max(l.start + 1) && *e > l.start);
+        let del = (l.start..l.end).any(|k| pool::obj(p.fmts[k].obj).is_some_and(|o| matches!(o.kind, ObjKind::Deleted(_))));
+        if ins || del {
+            rev_lines.insert(li);
+        }
+    }
     let pages = pager.page + 1;
     let section_of_line = |li: usize| section_starts.iter().filter(|s| **s <= li).count();
     let mut page_section = vec![0usize; pages];
@@ -1430,6 +1514,9 @@ pub fn layout(doc: &Document, fonts: &mut FontsView<'_>, zoom: f32) -> Layout {
         note_separators: separators,
         floats,
         nested,
+        rev_lines,
+        ins_ranges,
+        comment_ranges: if doc.comments.is_empty() { Vec::new() } else { find_comments(doc) },
     }
 }
 

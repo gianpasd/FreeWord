@@ -108,6 +108,7 @@ pub struct App {
     pub zoom: f32,
     pub show_marks: bool,
     pub show_ruler: bool,
+    pub show_comments: bool,
     pub dark: bool,
     pub tab: Tab,
     pub find: Find,
@@ -205,6 +206,7 @@ impl App {
             zoom: 1.0,
             show_marks: false,
             show_ruler: true,
+            show_comments: true,
             dark: false,
             tab: Tab::Home,
             find: Find::default(),
@@ -563,12 +565,17 @@ impl App {
     }
 
     pub fn insert_table(&mut self, rows: u32, cols: u32) {
-        if self.in_table().is_some() {
+        // Both ends of the selection matter: deleting it can leave the cursor in a cell.
+        let (a, b) = self.sel();
+        if self.doc.paras[a.p].cell.is_some() || self.doc.paras[b.p].cell.is_some() {
             self.set_status("Tables cannot be inserted inside a table cell");
             return;
         }
         self.checkpoint(EditKind::Other);
         self.delete_selection();
+        if self.in_table().is_some() {
+            return;
+        }
         let mut at = self.cursor.p;
         if self.cursor.o > 0 {
             let np = self.doc.split(self.cursor);
@@ -841,6 +848,106 @@ impl App {
         self.doc.ensure_trailing_para();
         let p = at.min(self.doc.paras.len() - 1);
         self.set_cursor(Pos::new(p, 0), false);
+    }
+
+    // ------------------------------------------------------------ review
+
+    pub fn has_revisions(&self) -> bool {
+        self.doc.paras.iter().any(|p| {
+            p.fmts.iter().any(|f| {
+                crate::pool::obj(f.obj).is_some_and(|o| match o.kind {
+                    crate::pool::ObjKind::Deleted(_) => true,
+                    crate::pool::ObjKind::Wrap { .. } => o.xml.starts_with("<w:ins") || o.xml.starts_with("<w:moveTo") || o.xml.starts_with("</w:ins") || o.xml.starts_with("</w:moveTo"),
+                    _ => false,
+                })
+            })
+        })
+    }
+
+    pub fn set_show_markup(&mut self, on: bool) {
+        crate::layout::SHOW_MARKUP.store(on, std::sync::atomic::Ordering::Relaxed);
+        self.rev += 1;
+    }
+
+    /// Accepts (or rejects) every tracked change in the body.
+    pub fn resolve_all_changes(&mut self, accept: bool) {
+        use crate::pool::{self, ObjKind};
+        self.checkpoint(EditKind::Other);
+        let mut strip_cache: HashMap<u32, u32> = HashMap::new();
+        let mut strip = |id: u32| -> u32 {
+            if id == 0 {
+                return 0;
+            }
+            *strip_cache.entry(id).or_insert_with(|| {
+                let kept: String = crate::xml::parse_elems(&pool::get(id))
+                    .into_iter()
+                    .filter(|e| !matches!(e.name.as_str(), "ins" | "del" | "moveFrom" | "moveTo" | "rPrChange"))
+                    .map(|e| e.to_xml())
+                    .collect();
+                pool::intern(&kept)
+            })
+        };
+        let mut merge_after: Vec<usize> = Vec::new();
+        for (pi, p) in self.doc.paras.iter_mut().enumerate() {
+            // Paragraph marks that were inserted (reject) or deleted (accept) join the next paragraph.
+            let mark = pool::get(p.end_fmt.rpr_extra);
+            if (accept && mark.contains("<w:del ")) || (!accept && mark.contains("<w:ins ")) {
+                merge_after.push(pi);
+            }
+            let mut chars = Vec::with_capacity(p.chars.len());
+            let mut fmts = Vec::with_capacity(p.fmts.len());
+            let mut inside_ins = 0usize;
+            for (c, f) in p.chars.iter().zip(&p.fmts) {
+                let mut f = *f;
+                match pool::obj(f.obj).map(|o| (o.kind, o.xml)) {
+                    Some((ObjKind::Wrap { open: true }, x)) if x.starts_with("<w:ins") || x.starts_with("<w:moveTo") => {
+                        inside_ins += 1;
+                        continue;
+                    }
+                    Some((ObjKind::Wrap { open: false }, x)) if x.starts_with("</w:ins") || x.starts_with("</w:moveTo") => {
+                        inside_ins = inside_ins.saturating_sub(1);
+                        continue;
+                    }
+                    Some((ObjKind::Deleted(text), _)) => {
+                        if !accept {
+                            // Rejecting a deletion restores its text.
+                            f.obj = 0;
+                            f.rpr_extra = strip(f.rpr_extra);
+                            for ch in text.chars() {
+                                chars.push(ch);
+                                fmts.push(f);
+                            }
+                        }
+                        continue;
+                    }
+                    _ => {}
+                }
+                if inside_ins > 0 && !accept {
+                    continue;
+                }
+                f.rpr_extra = strip(f.rpr_extra);
+                chars.push(*c);
+                fmts.push(f);
+            }
+            p.chars = chars;
+            p.fmts = fmts;
+            p.end_fmt.rpr_extra = strip(p.end_fmt.rpr_extra);
+            p.ppr_extra = crate::xml::parse_elems(&p.ppr_extra)
+                .into_iter()
+                .filter(|e| e.name != "pPrChange")
+                .map(|e| e.to_xml())
+                .collect();
+        }
+        for pi in merge_after.into_iter().rev() {
+            if pi + 1 < self.doc.paras.len() && self.doc.paras[pi].cell == self.doc.paras[pi + 1].cell {
+                let end = Pos::new(pi, self.doc.paras[pi].len());
+                self.doc.delete(end, Pos::new(pi + 1, 0));
+            }
+        }
+        self.doc.gc_images();
+        let c = self.doc.clamp(self.cursor);
+        self.select(c, c);
+        self.set_status(if accept { "All changes accepted" } else { "All changes rejected" });
     }
 
     // ------------------------------------------------------------ spelling

@@ -1042,6 +1042,26 @@ impl App {
                 self.dlg.word_count = true;
             }
         });
+        group(ui, "Tracking", |ui| {
+            let markup = crate::layout::show_markup();
+            if big_btn_sel(ui, "✎", "Show Markup", markup, "Show insertions and deletions (otherwise show the final text with change bars)").clicked() {
+                self.set_show_markup(!markup);
+            }
+            let has = self.has_revisions();
+            if ui.add_enabled_ui(has, |ui| big_btn(ui, "✔", "Accept All", "Accept all tracked changes")).inner.clicked() {
+                self.resolve_all_changes(true);
+            }
+            if ui.add_enabled_ui(has, |ui| big_btn(ui, "✖", "Reject All", "Reject all tracked changes")).inner.clicked() {
+                self.resolve_all_changes(false);
+            }
+        });
+        group(ui, "Comments", |ui| {
+            let n = self.doc.comments.len();
+            let label = if n == 0 { "No Comments".to_string() } else { format!("Comments ({n})") };
+            if big_btn_sel(ui, "💬", &label, self.show_comments && n > 0, "Show comments beside the page").clicked() {
+                self.show_comments = !self.show_comments;
+            }
+        });
         group(ui, "Language", |ui| {
             ui.vertical(|ui| {
                 let current = self.spell.active.clone();

@@ -132,7 +132,13 @@ pub fn run(input: &Path, output: &Path, seed: u64, steps: usize) -> Result<(), S
             33 | 34 => app.undo(),
             35 => app.redo(),
             36 => app.change_case(r.below(5) as u8),
-            37 => app.insert_page_break(),
+            37 => {
+                if r.chance(15) {
+                    app.resolve_all_changes(r.chance(50));
+                } else {
+                    app.insert_page_break();
+                }
+            }
             38 => app.insert_line_break(),
             _ => {
                 app.find.query = "a".into();

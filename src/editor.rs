@@ -11,6 +11,8 @@ use eframe::egui::{
 };
 
 pub const GAP: f32 = 24.0;
+/// Width of comment cards beside the page.
+const COMMENT_W: f32 = 230.0;
 
 pub fn c32(c: Rgba) -> Color32 {
     Color32::from_rgba_unmultiplied(c[0], c[1], c[2], c[3])
@@ -238,8 +240,14 @@ impl App {
 
     // ================================================================ canvas
 
+    /// Width reserved to the right of the pages for comment cards.
+    pub fn comments_width(&self) -> f32 {
+        if self.show_comments && !self.doc.comments.is_empty() { COMMENT_W + 2.0 * GAP } else { 0.0 }
+    }
+
     fn page_origin(&self, rect: Rect, lay: &Layout, page: usize) -> Pos2 {
-        let x = rect.left() + ((rect.width() - lay.page_w) / 2.0).max(GAP);
+        let cw = self.comments_width();
+        let x = rect.left() + ((rect.width() - cw - lay.page_w) / 2.0).max(GAP);
         pos2(x, rect.top() + GAP + page as f32 * (lay.page_h + GAP))
     }
 
@@ -276,7 +284,7 @@ impl App {
         self.ensure_layout();
         let lay = self.layout.take().unwrap();
         let avail = ui.available_size();
-        let total_w = (lay.page_w + 2.0 * GAP).max(avail.x);
+        let total_w = (lay.page_w + 2.0 * GAP + self.comments_width()).max(avail.x);
         let total_h = lay.pages as f32 * (lay.page_h + GAP) + GAP;
         let (rect, resp) = ui.allocate_exact_size(vec2(total_w, total_h), Sense::click_and_drag());
         let id = resp.id;
@@ -565,6 +573,7 @@ impl App {
             self.refresh_find();
         }
         let matches = if self.find.open { self.find.matches.clone() } else { Vec::new() };
+        let comment_ranges = if self.show_comments { lay.comment_ranges.clone() } else { Vec::new() };
         let ids: Vec<u32> = self.doc.all_images().into_iter().map(|(k, _)| k).collect();
         for id in ids {
             self.texture(ui.ctx(), id);
@@ -617,6 +626,17 @@ impl App {
                     let e = mb.o.min(l.end);
                     let col = if current == Some(i) { [255, 170, 60, 255] } else { [255, 238, 150, 255] };
                     cv.rect(x_of(s), top, x_of(e) - x_of(s), l.height, col);
+                }
+                // Commented text.
+                for (_, cs, ce) in comment_ranges.iter() {
+                    if l.para < cs.p || l.para > ce.p {
+                        continue;
+                    }
+                    let s = if l.para == cs.p { cs.o } else { 0 }.max(l.start);
+                    let e = if l.para == ce.p { ce.o } else { usize::MAX }.min(l.end);
+                    if s < e {
+                        cv.rect(x_of(s), top, x_of(e) - x_of(s), l.height, [0xFF, 0xE7, 0x99, 255]);
+                    }
                 }
                 // Selection.
                 if has_sel && l.para >= sa.p && l.para <= sb.p {
@@ -744,6 +764,42 @@ impl App {
             }
         }
 
+        // Comment cards beside the pages.
+        if !comment_ranges.is_empty() {
+            let mut next_free = f32::MIN;
+            for (id, cs, _) in &comment_ranges {
+                let Some(c) = self.doc.comments.get(id) else { continue };
+                let (pg, x, y, _) = lay.caret(*cs);
+                let o = self.page_origin(rect, lay, pg);
+                let anchor = o + vec2(x, y);
+                let card_x = o.x + lay.page_w + GAP;
+                let mut job = LayoutJob::default();
+                job.wrap.max_width = COMMENT_W - 16.0;
+                job.append(
+                    &format!(
+                        "{}{}\n",
+                        if !c.author.is_empty() { &c.author } else if !c.initials.is_empty() { &c.initials } else { "Comment" },
+                        c.date.get(..10).map(|d| format!("  ·  {d}")).unwrap_or_default()
+                    ),
+                    0.0,
+                    TextFormat { font_id: egui::FontId::proportional(12.0), color: Color32::from_rgb(0x2B, 0x57, 0x9A), ..Default::default() },
+                );
+                job.append(&c.text, 0.0, TextFormat { font_id: egui::FontId::proportional(12.0), color: Color32::from_gray(40), ..Default::default() });
+                let galley = painter.layout_job(job);
+                let h = galley.size().y + 14.0;
+                let top = anchor.y.max(next_free);
+                next_free = top + h + 6.0;
+                let card = Rect::from_min_size(pos2(card_x, top), vec2(COMMENT_W, h));
+                if !card.intersects(clip) {
+                    continue;
+                }
+                painter.line_segment([anchor, pos2(card_x, top + 10.0)], Stroke::new(1.0, Color32::from_rgb(0xD9, 0xA4, 0x41)));
+                painter.rect_filled(card, 4.0, Color32::from_rgb(0xFF, 0xFB, 0xEA));
+                painter.rect_stroke(card, 4.0, Stroke::new(1.0, Color32::from_rgb(0xD9, 0xA4, 0x41)), StrokeKind::Inside);
+                painter.galley(card.min + vec2(8.0, 7.0), galley, Color32::BLACK);
+            }
+        }
+
         // Caret.
         if caret_on && !self.text_input_focused && (!has_sel || self.drag.selecting) && self.selected_image().is_none() {
             let (pg, x, y, h) = lay.caret(self.cursor);
@@ -762,8 +818,9 @@ impl App {
         let p = ui.painter_at(rect);
         let dark = ui.visuals().dark_mode;
         p.rect_filled(rect, 0.0, if dark { Color32::from_gray(45) } else { Color32::from_gray(235) });
-        let total_w = (lay.page_w + 2.0 * GAP).max(rect.width());
-        let x0 = rect.left() + ((total_w - lay.page_w) / 2.0).max(GAP);
+        let cw = self.comments_width();
+        let total_w = (lay.page_w + 2.0 * GAP + cw).max(rect.width());
+        let x0 = rect.left() + ((total_w - cw - lay.page_w) / 2.0).max(GAP);
         let [_, mr, _, ml] = lay.margins;
         let page = Rect::from_min_max(pos2(x0, rect.top() + 3.0), pos2(x0 + lay.page_w, rect.bottom() - 3.0));
         p.rect_filled(page, 0.0, Color32::from_gray(200));

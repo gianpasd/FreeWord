@@ -62,6 +62,8 @@ pub enum ObjKind {
     NoteRef { endnote: bool, id: String },
     /// Start/end tag of a paragraph-level wrapper such as a tracked insertion.
     Wrap { open: bool },
+    /// Tracked deletion (`w:del`/`w:moveFrom`) with its deleted text.
+    Deleted(String),
 }
 
 #[derive(Clone, Debug)]

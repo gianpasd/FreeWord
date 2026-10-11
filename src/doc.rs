@@ -745,6 +745,15 @@ pub struct Package {
     pub background: Option<String>,
 }
 
+/// A reviewer comment (`comments.xml`).
+#[derive(Clone, Debug, Default)]
+pub struct Comment {
+    pub author: String,
+    pub initials: String,
+    pub date: String,
+    pub text: String,
+}
+
 /// Rich header/footer content read from a .docx (laid out like the body).
 #[derive(Clone, Debug, Default)]
 pub struct HeaderFooter {
@@ -763,6 +772,8 @@ pub struct Document {
     pub hf: Arc<Vec<HeaderFooter>>,
     /// Footnote (false) and endnote (true) texts by w:id.
     pub notes: Arc<BTreeMap<(bool, String), Document>>,
+    /// Comments by w:id.
+    pub comments: Arc<BTreeMap<String, Comment>>,
     pub page: PageSetup,
     pub header: String,
     pub footer: String,
@@ -797,6 +808,7 @@ impl Document {
             paras: vec![Para::new(Style::Normal)],
             hf: Arc::new(Vec::new()),
             notes: Arc::new(BTreeMap::new()),
+            comments: Arc::new(BTreeMap::new()),
             page: PageSetup::default(),
             header: String::new(),
             footer: String::new(),

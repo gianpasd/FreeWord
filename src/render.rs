@@ -192,6 +192,12 @@ fn draw_content<C: Canvas>(
         }
         para_borders(c, doc, lay, l);
         draw_line(c, doc, lay, l, page_no);
+        // Change bar in the left margin.
+        if lay.rev_lines.contains(&li) {
+            let x = lay.margins[3] - 14.0 * sc;
+            let col = if layout::show_markup() { [0x80, 0x80, 0x80, 255] } else { [0xC0, 0x00, 0x00, 255] };
+            c.line(x, l.y, x, l.y + l.height, (0.75 * sc).max(1.0), col);
+        }
     }
     // Cell borders on top of everything else.
     for cell in lay.cells.iter().filter(|b| b.page == page) {
@@ -334,6 +340,16 @@ fn draw_line<C: Canvas>(c: &mut C, doc: &Document, lay: &Layout, l: &Line, page_
         if f.obj != 0 {
             let Some(o) = pool::obj(f.obj) else { continue };
             match &o.kind {
+                ObjKind::Deleted(text) => {
+                    if layout::show_markup() {
+                        let mut df = f;
+                        df.color = [0xC0, 0x00, 0x00, 255];
+                        let (fid, _) = layout::font_for(&df, sc);
+                        c.text(x0, base, text, &df, fid.size);
+                        let th = (fid.size * 0.06).max(0.75);
+                        c.line(x0, base - fid.size * 0.28, x1, base - fid.size * 0.28, th, df.color);
+                    }
+                }
                 ObjKind::Box { anchor: Some(_), .. } => {}
                 ObjKind::Box { label, w, h, .. } => {
                     let (w, h) = (w * sc, h * sc);
@@ -356,6 +372,12 @@ fn draw_line<C: Canvas>(c: &mut C, doc: &Document, lay: &Layout, l: &Line, page_
                 }
             }
             continue;
+        }
+        // Tracked insertions in markup view: coloured and underlined.
+        let mut f = f;
+        if layout::show_markup() && lay.ins_ranges.iter().any(|(p, a, b)| *p == l.para && s.start >= *a && s.start < *b) {
+            f.color = [0xC0, 0x00, 0x00, 255];
+            f.underline = true;
         }
         let (fid, _) = layout::font_for(&f, sc);
         let size = if s.small { fid.size * 0.8 } else { fid.size };
